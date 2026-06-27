@@ -741,7 +741,7 @@ def get_predicates_df(cfg: TaskExtractorConfig, data_config: DictConfig) -> pl.D
     # a column of 0s with 1 in the last event of each subject_id representing the end of record
     logger.info("Generating special predicate columns...")
     special_predicates = []
-    for window in cfg.windows.values():
+    for window in cfg.all_windows.values():
         if ANY_EVENT_COLUMN in window.referenced_predicates and ANY_EVENT_COLUMN not in special_predicates:
             special_predicates.append(ANY_EVENT_COLUMN)
         if (

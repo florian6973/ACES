@@ -208,3 +208,50 @@ those endpoints are left unconstrained. Likewise, unreferenced predicates are al
 > the constraint for predicate `name` with constraint `name: (1, 2)` if the count of observations of predicate
 > `name` in a window was either 1 or 2. All constraints in the dictionary must be satisfied on a window for it
 > to be included.
+
+______________________________________________________________________
+
+### Label-defining windows: `windows_pos` and `windows_neg`
+
+ACES supports two ways to attach a binary label to the extracted cohort. The first is the per-window `label`
+field documented above: exactly one window carries `label: <predicate>`, and the label is the (binarized)
+count of that predicate over that single window. The second, `windows_pos`, **replaces** `label` and lets the
+positive class be defined by an *additional group of windows* rather than a single predicate in a single
+window.
+
+The key distinction is **gating**. Every window in the base `windows` block is *gating*: if its constraints
+are not satisfiable for a trigger, that trigger is excluded from the cohort. By contrast, `windows_pos` (and
+the optional `windows_neg`) are **non-gating**: failing them changes the *label*, it does **not** drop the
+trigger. This matters whenever the positive class is a temporally complex outcome that should not prune the
+cohort or its negatives (e.g. "the AMI occurred during an inpatient/ER encounter"): expressing it with
+mandatory, event-anchored windows would silently drop every true negative, whereas `windows_pos` keeps them
+as `label: 0`.
+
+Both are optional, top-level fields (siblings of `windows`), each a dictionary from window names to
+{py:class}`aces.config.WindowConfig` objects, with the same referencing grammar as base windows (they may
+reference the `trigger`, any base window's endpoints, and one another within their own group).
+
+Given the base windows `Wb`, `windows_pos` = `Wp`, and `windows_neg` = `Wn`:
+
+- **Eligible cohort** `E`: triggers satisfying all of `Wb` (one output row each).
+- **Positive** `P ⊆ E`: eligible triggers that *also* satisfy all of `Wp`. These get `label: 1`.
+- **Negative** `N`:
+  - If `windows_neg` is **omitted**, `N = E \ P` (the implicit complement): every eligible trigger is
+    emitted, with `label: 0` wherever `Wp` was not satisfied.
+  - If `windows_neg` is **present**, `N` is the eligible triggers satisfying all of `Wn`. Only `P ∪ N` are
+    emitted (`label: 1` on `P`, `label: 0` on `N`); eligible triggers matching **neither** group are dropped
+    (the "exclude the ambiguous middle" case/control pattern). A trigger matching **both** groups is a config
+    defect — `Wp` and `Wn` must be mutually exclusive — and raises an error rather than silently dropping the
+    row or picking a side.
+
+The current `label: P` on a window `W` is exactly the special case of a single `windows_pos` window spanning
+`W` with `has: {P: (1, None)}`, so migrating a task is mechanical; `windows_pos` then additionally allows more
+than one window and full event-anchored structure.
+
+> [!NOTE]
+> `windows_pos` is mutually exclusive with the `label` field (a config uses one labeling mechanism or the
+> other), and `windows_neg` may only be specified alongside `windows_pos`. The label-defining windows may not
+> set their own `label` or `index_timestamp`: the prediction time is a property of the cohort and must be
+> sourced from an `index_timestamp` on a base window, identically for positives and negatives. When neither
+> `label` nor `windows_pos` is present, the output simply has no label column. See
+> `sample_configs/windows_pos_label.yaml` for a worked example.

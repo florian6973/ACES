@@ -1,0 +1,68 @@
+# Task: First-AMI-in-encounter labeling via label-defining windows (`windows_pos`).
+#
+# This config demonstrates `windows_pos`, which REPLACES the single-window `label` field. The base
+# `windows` gate the cohort (every eligible trigger is emitted); `windows_pos` then assigns the binary
+# label WITHOUT gating the cohort -- a trigger that fails it is kept as a negative (label 0) rather than
+# dropped. This lets a temporally complex outcome (here: an AMI occurring inside an inpatient/ER
+# encounter) define the positive class without pruning the negatives.
+#
+# Semantics:
+#   - eligible cohort  : triggers satisfying the base `windows`
+#   - positive (label 1): eligible triggers that ALSO satisfy every `windows_pos` window
+#   - negative (label 0): the remaining eligible triggers (implicit complement)
+
+predicates:
+  visit:
+    code: { regex: "VISIT//.*" }
+  ami:
+    code: MI
+  ip_er_start:
+    code: { regex: "ENCOUNTER_START//(INPATIENT|ER)" }
+  ip_er_end:
+    code: { regex: "ENCOUNTER_END//(INPATIENT|ER)" }
+  clinical_event:
+    code: { any: ["MI", "LAB//HR", "LAB//SpO2"] }
+
+trigger: visit
+
+# BASE windows -- cohort gating (unchanged ACES semantics). Every visit with at least one clinical
+# event over the two-year look-back is eligible; the prediction time is the trigger.
+windows:
+  trigger_window:
+    start: NULL
+    end: trigger
+    start_inclusive: True
+    end_inclusive: True
+    index_timestamp: end
+  sufficient_history:
+    start: trigger - 730d
+    end: start + 730d
+    start_inclusive: True
+    end_inclusive: True
+    has:
+      clinical_event: (1, None)
+
+# windows_pos -- positive-label-defining windows (NON-gating). Positive iff an AMI occurs within the
+# prediction year AND that AMI sits inside an inpatient/ER interval [ip_er_start, ip_er_end].
+windows_pos:
+  ami_in_year:
+    start: trigger
+    end: start + 365d
+    start_inclusive: True
+    end_inclusive: True
+    has:
+      ami: (1, None)
+  ami_enc_right:
+    start: trigger -> ami            # anchor on the AMI
+    end: start -> ip_er_end          # the next inpatient/ER discharge
+    start_inclusive: True
+    end_inclusive: True
+    has:
+      ip_er_start: (None, 0)         # no NEW admission between the AMI and that discharge
+  ami_enc_left:
+    start: end <- ip_er_start        # the previous inpatient/ER admission
+    end: trigger -> ami              # the same AMI
+    start_inclusive: True
+    end_inclusive: True
+    has:
+      ip_er_end: (None, 0)           # no discharge between that admission and the AMI

@@ -11,9 +11,12 @@ from bigtree import preorder_iter
 from .config import TaskExtractorConfig
 from .constraints import check_constraints, check_static_variables
 from .extract_subtree import extract_subtree
+from .types import PRED_CNT_TYPE
 from .utils import log_tree
 
 logger = logging.getLogger(__name__)
+
+LABEL_JOIN_KEYS = ["subject_id", "trigger"]
 
 
 def query(cfg: TaskExtractorConfig, predicates_df: pl.DataFrame) -> pl.DataFrame:
@@ -114,6 +117,19 @@ def query(cfg: TaskExtractorConfig, predicates_df: pl.DataFrame) -> pl.DataFrame
     if not is_unique:
         raise ValueError("The (subject_id, timestamp) columns must be unique.")
 
+    if cfg.windows_pos is not None:
+        return _query_label_windows(cfg, predicates_df)
+
+    return _extract_cohort(cfg, predicates_df)
+
+
+def _extract_cohort(cfg: TaskExtractorConfig, predicates_df: pl.DataFrame) -> pl.DataFrame:
+    """Extract the cohort defined by ``cfg``'s base windows, returning one row per valid trigger.
+
+    This is the single-pass ACES extraction: it realizes the window tree, attaches the ``label`` and
+    ``index_timestamp`` columns when those fields are present, and is the building block the label-window
+    multi-pass driver (:func:`_query_label_windows`) runs for the eligible, positive, and negative passes.
+    """
     log_tree(cfg.window_tree)
 
     logger.info("Beginning query...")
@@ -195,3 +211,98 @@ def query(cfg: TaskExtractorConfig, predicates_df: pl.DataFrame) -> pl.DataFrame
         to_return_cols.insert(1, "index_timestamp")
 
     return result.select(to_return_cols)
+
+
+def _label_keys(cohort: pl.DataFrame, eligible: pl.DataFrame) -> pl.DataFrame:
+    """Return the unique ``(subject_id, trigger)`` keys identifying the rows in a label-pass ``cohort``.
+
+    ``cohort`` may be an empty :class:`polars.DataFrame` (no columns) when a pass yields no rows; in that case
+    an empty key frame with the schema of ``eligible`` is returned so downstream joins remain well-typed.
+    """
+    if cohort.is_empty() or "subject_id" not in cohort.columns:
+        return eligible.select(LABEL_JOIN_KEYS).clear()
+    return cohort.select(LABEL_JOIN_KEYS).unique()
+
+
+def _order_label_columns(result: pl.DataFrame) -> pl.DataFrame:
+    """Order columns as ``subject_id, [index_timestamp], label, trigger, <window summaries...>``."""
+    leading = ["subject_id"]
+    if "index_timestamp" in result.columns:
+        leading.append("index_timestamp")
+    leading.append("label")
+    ordered = leading + [c for c in result.columns if c not in leading]
+    return result.select(ordered)
+
+
+def _query_label_windows(cfg: TaskExtractorConfig, predicates_df: pl.DataFrame) -> pl.DataFrame:
+    """Assign binary labels via the ``windows_pos`` / ``windows_neg`` label-defining window groups.
+
+    Implements the multi-pass reference design: the base ``windows`` define the eligible cohort ``E`` (one row
+    per valid trigger); a second pass over base + ``windows_pos`` yields the positive subset ``P ⊆ E``; and,
+    when ``windows_neg`` is given, a third pass over base + ``windows_neg`` yields the negative set ``N``. The
+    passes share the same trigger/index, so they are joined on ``(subject_id, trigger)``.
+
+    - ``windows_neg`` omitted: every eligible trigger is emitted; ``label = 1`` on ``P``, else ``0``.
+    - ``windows_neg`` present: only ``P ∪ N`` are emitted (``label = 1`` on ``P``, ``0`` on ``N``); eligible
+      triggers matching neither are dropped (the ambiguous middle). A trigger matching *both* groups is a
+      config defect (``Wp``/``Wn`` are not mutually exclusive) and raises a ``ValueError``.
+
+    Raises:
+        ValueError: If any eligible trigger satisfies both ``windows_pos`` and ``windows_neg``.
+    """
+    logger.info("Labeling via 'windows_pos'%s...", " / 'windows_neg'" if cfg.windows_neg else "")
+
+    eligible = _extract_cohort(cfg, predicates_df)
+    if eligible.is_empty():
+        logger.warning("No eligible triggers found for the base windows. Exiting.")
+        return eligible
+
+    positive = _extract_cohort(cfg.positive_config, predicates_df)
+    pos_keys = _label_keys(positive, eligible).with_columns(pl.lit(True).alias("_is_pos"))
+
+    if cfg.windows_neg is None:
+        result = eligible.join(pos_keys, on=LABEL_JOIN_KEYS, how="left").with_columns(
+            pl.col("_is_pos").fill_null(False).cast(PRED_CNT_TYPE).alias("label")
+        )
+        result = result.drop("_is_pos")
+    else:
+        negative = _extract_cohort(cfg.negative_config, predicates_df)
+        neg_keys = _label_keys(negative, eligible).with_columns(pl.lit(True).alias("_is_neg"))
+
+        marked = (
+            eligible.join(pos_keys, on=LABEL_JOIN_KEYS, how="left")
+            .join(neg_keys, on=LABEL_JOIN_KEYS, how="left")
+            .with_columns(
+                pl.col("_is_pos").fill_null(False),
+                pl.col("_is_neg").fill_null(False),
+            )
+        )
+
+        n_conflict = marked.filter(pl.col("_is_pos") & pl.col("_is_neg")).height
+        if n_conflict:
+            raise ValueError(
+                f"{n_conflict:,} eligible trigger(s) matched both 'windows_pos' and 'windows_neg', which is "
+                "ambiguous. Make the positive and negative window groups mutually exclusive."
+            )
+
+        # Keep the unambiguous positives and negatives; drop the ambiguous middle (matching neither group).
+        # Conflicts (matching both) have already errored out above, so '|' here cannot mislabel a trigger.
+        result = (
+            marked.filter(pl.col("_is_pos") | pl.col("_is_neg"))
+            .with_columns(pl.col("_is_pos").cast(PRED_CNT_TYPE).alias("label"))
+            .drop("_is_pos", "_is_neg")
+        )
+
+    if not result.is_empty() and result["label"].n_unique() == 1:
+        logger.warning(
+            f"All labels in the extracted cohort are the same: '{result['label'][0]}'. "
+            "This may indicate an issue with the task logic. "
+            "Please double-check your configuration file if this is not expected."
+        )
+
+    logger.info(
+        f"Done. {result.shape[0]:,} labeled rows returned corresponding to "
+        f"{result['subject_id'].n_unique():,} subjects."
+    )
+
+    return _order_label_columns(result)

@@ -1094,6 +1094,8 @@ class TaskExtractorConfig:
     predicates: dict[str, PlainPredicateConfig | DerivedPredicateConfig]
     trigger: EventConfig
     windows: dict[str, WindowConfig] | None
+    windows_pos: dict[str, WindowConfig] | None = None
+    windows_neg: dict[str, WindowConfig] | None = None
     label_window: str | None = None
     index_timestamp_window: str | None = None
 
@@ -1142,6 +1144,7 @@ class TaskExtractorConfig:
                                 windows={'start': WindowConfig(start=None, end='trigger + 24h',
                                                     start_inclusive=True, end_inclusive=True, has={},
                                                     label=None, index_timestamp=None)},
+                                windows_pos=None, windows_neg=None,
                                 label_window=None, index_timestamp_window=None)
 
             >>> predicates_dict = {
@@ -1172,6 +1175,7 @@ class TaskExtractorConfig:
                                 windows={'start': WindowConfig(start=None, end='trigger + 24h',
                                                     start_inclusive=True, end_inclusive=True, has={},
                                                     label=None, index_timestamp=None)},
+                                windows_pos=None, windows_neg=None,
                                 label_window=None, index_timestamp_window=None)
 
             >>> config_dict = {
@@ -1330,6 +1334,8 @@ class TaskExtractorConfig:
 
         trigger = loaded_dict.pop("trigger")
         windows = loaded_dict.pop("windows", None)
+        windows_pos = loaded_dict.pop("windows_pos", None)
+        windows_neg = loaded_dict.pop("windows_neg", None)
 
         predicates = loaded_dict.pop("predicates", {})
         patient_demographics = loaded_dict.pop("patient_demographics", {})
@@ -1350,17 +1356,33 @@ class TaskExtractorConfig:
         else:
             windows = {n: WindowConfig(**w) for n, w in windows.items()}
 
+        # Parse the optional label-defining window groups (windows_pos / windows_neg). These replace the
+        # `label` field: cohort membership is decided by `windows` (base), while `windows_pos` (and, if given,
+        # `windows_neg`) decide the binary label without gating the cohort. See `_initialize_label_windows`.
+        if windows_pos is not None:
+            windows_pos = {n: WindowConfig(**w) for n, w in windows_pos.items()}
+        if windows_neg is not None:
+            windows_neg = {n: WindowConfig(**w) for n, w in windows_neg.items()}
+
         logger.info("Parsing trigger event...")
         trigger = EventConfig(trigger)
 
-        # add window referenced predicates
-        referenced_predicates = {pred for w in windows.values() for pred in w.referenced_predicates}
+        # add window referenced predicates (from base and any label-defining window groups)
+        label_window_groups = [g for g in (windows_pos, windows_neg) if g is not None]
+        referenced_predicates = {
+            pred
+            for group in (windows, *label_window_groups)
+            for w in group.values()
+            for pred in w.referenced_predicates
+        }
 
         # add trigger predicate
         referenced_predicates.add(trigger.predicate)
 
         # add label predicate if it exists and not already added
-        label_reference = [w.label for w in windows.values() if w.label]
+        label_reference = [
+            w.label for group in (windows, *label_window_groups) for w in group.values() if w.label
+        ]
         if label_reference:
             referenced_predicates.update(set(label_reference))
 
@@ -1416,7 +1438,13 @@ class TaskExtractorConfig:
             }
             predicate_objs.update(final_demographics)
 
-        return cls(predicates=predicate_objs, trigger=trigger, windows=windows)
+        return cls(
+            predicates=predicate_objs,
+            trigger=trigger,
+            windows=windows,
+            windows_pos=windows_pos,
+            windows_neg=windows_neg,
+        )
 
     def _initialize_predicates(self) -> None:
         """Initialize the predicates tree from the configuration object and check validity.
@@ -1665,9 +1693,162 @@ class TaskExtractorConfig:
 
         self.window_nodes = window_nodes
 
+    def _initialize_label_windows(self) -> None:
+        """Validate the optional ``windows_pos`` / ``windows_neg`` label-defining window groups.
+
+        ``windows_pos`` (and the optional ``windows_neg``) generalize the single-window ``label`` field: the
+        cohort is gated by the base ``windows``, while these groups assign the binary label *without* gating
+        the cohort (failing them sets the label to 0; it does not drop the trigger). The two mechanisms are
+        mutually exclusive, and the label-defining windows may not carry ``label`` or ``index_timestamp`` of
+        their own (the prediction time is a property of the cohort, sourced from a base window).
+
+        Raises:
+            ValueError: If the label-defining window groups are misconfigured.
+
+        Examples:
+            >>> base = {"input": WindowConfig(None, "trigger", True, False, index_timestamp="end")}
+            >>> pos = {"outcome": WindowConfig("trigger", "start + 365d", True, True,
+            ...                                has={"A": "(1, None)"})}
+            >>> cfg = TaskExtractorConfig(
+            ...     predicates={"A": PlainPredicateConfig("A")},
+            ...     trigger=EventConfig("_ANY_EVENT"),
+            ...     windows=base, windows_pos=pos,
+            ... )
+            >>> cfg.windows_neg is None
+            True
+            >>> TaskExtractorConfig(
+            ...     predicates={"A": PlainPredicateConfig("A")},
+            ...     trigger=EventConfig("_ANY_EVENT"),
+            ...     windows=base, windows_neg=pos,
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: 'windows_neg' may only be specified alongside 'windows_pos'.
+            >>> labeled_base = {"input": WindowConfig(None, "trigger", True, False, label="A")}
+            >>> TaskExtractorConfig(
+            ...     predicates={"A": PlainPredicateConfig("A")},
+            ...     trigger=EventConfig("_ANY_EVENT"),
+            ...     windows=labeled_base, windows_pos=pos,
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: 'label' and 'windows_pos' are mutually exclusive; specify exactly one labeling
+            mechanism.
+            >>> bad_pos = {"outcome": WindowConfig("trigger", "start + 365d", True, True, label="A")}
+            >>> TaskExtractorConfig(
+            ...     predicates={"A": PlainPredicateConfig("A")},
+            ...     trigger=EventConfig("_ANY_EVENT"),
+            ...     windows=base, windows_pos=bad_pos,
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: Label-defining window 'outcome' in 'windows_pos' may not set 'label'.
+            >>> ts_pos = {"outcome": WindowConfig("trigger", "start + 365d", True, True,
+            ...                                   index_timestamp="end")}
+            >>> TaskExtractorConfig(
+            ...     predicates={"A": PlainPredicateConfig("A")},
+            ...     trigger=EventConfig("_ANY_EVENT"),
+            ...     windows=base, windows_pos=ts_pos,
+            ... )
+            Traceback (most recent call last):
+                ...
+            ValueError: Label-defining window 'outcome' in 'windows_pos' may not set 'index_timestamp';
+            index_timestamp must live on a base window.
+        """
+        self._positive_config = None
+        self._negative_config = None
+
+        if self.windows_neg and not self.windows_pos:
+            raise ValueError("'windows_neg' may only be specified alongside 'windows_pos'.")
+
+        if not self.windows_pos:
+            return
+
+        if self.label_window is not None:
+            raise ValueError(
+                "'label' and 'windows_pos' are mutually exclusive; specify exactly one labeling mechanism."
+            )
+
+        for group_name, group in (("windows_pos", self.windows_pos), ("windows_neg", self.windows_neg)):
+            if group is None:
+                continue
+            for wname, w in group.items():
+                if re.match(r"^\w+$", wname) is None:
+                    raise ValueError(
+                        f"Window name '{wname}' is invalid; must be composed of alphanumeric or '_' "
+                        "characters."
+                    )
+                if w.label is not None:
+                    raise ValueError(
+                        f"Label-defining window '{wname}' in '{group_name}' may not set 'label'."
+                    )
+                if w.index_timestamp is not None:
+                    raise ValueError(
+                        f"Label-defining window '{wname}' in '{group_name}' may not set 'index_timestamp'; "
+                        "index_timestamp must live on a base window."
+                    )
+                if wname in self.windows:
+                    raise ValueError(
+                        f"Window name '{wname}' in '{group_name}' collides with a base window of the same "
+                        "name."
+                    )
+
+        if self.windows_neg:
+            overlap = set(self.windows_pos) & set(self.windows_neg)
+            if overlap:
+                raise ValueError(
+                    "Window names must be unique across 'windows_pos' and 'windows_neg'. "
+                    f"Found collisions: {', '.join(sorted(overlap))}"
+                )
+
+        if len(self.windows_pos) == 0:
+            logger.warning(
+                "'windows_pos' is empty; every eligible trigger will be labeled positive (label 1)."
+            )
+
+        # Build derived configs combining the base windows with each label group. Constructing these
+        # TaskExtractorConfig objects re-uses all of the existing window/reference validation (the
+        # label-defining windows reference the trigger and base windows just like any other window). The
+        # derived configs carry no label groups of their own, so this does not recurse.
+        self._positive_config = self._derived_label_config(self.windows_pos)
+        if self.windows_neg:
+            self._negative_config = self._derived_label_config(self.windows_neg)
+
+    def _derived_label_config(self, extra_windows: dict[str, WindowConfig]) -> TaskExtractorConfig:
+        """Return a base-only :class:`TaskExtractorConfig` extended with ``extra_windows``.
+
+        Used to realize the multi-pass label-window extraction: the positive (and optional negative) passes
+        run the base windows together with a label group as an ordinary ACES extraction.
+        """
+        return TaskExtractorConfig(
+            predicates=self.predicates,
+            trigger=self.trigger,
+            windows={**self.windows, **extra_windows},
+        )
+
     def __post_init__(self) -> None:
         self._initialize_predicates()
         self._initialize_windows()
+        self._initialize_label_windows()
+
+    @property
+    def positive_config(self) -> TaskExtractorConfig | None:
+        """The base + ``windows_pos`` config whose surviving triggers form the positive (label 1) class."""
+        return self._positive_config
+
+    @property
+    def negative_config(self) -> TaskExtractorConfig | None:
+        """The base + ``windows_neg`` config, or ``None`` when the negative class is the implicit complement."""
+        return self._negative_config
+
+    @property
+    def all_windows(self) -> dict[str, WindowConfig]:
+        """All window configs across the base and label-defining groups, keyed by name."""
+        merged = dict(self.windows)
+        for group in (self.windows_pos, self.windows_neg):
+            if group:
+                merged.update(group)
+        return merged
 
     @property
     def window_tree(self) -> Node:
