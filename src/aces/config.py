@@ -41,6 +41,62 @@ class PlainPredicateConfig:
     static: bool = False
     other_cols: dict[str, str] = field(default_factory=dict)
 
+    def code_matching_expr(self) -> pl.Expr:
+        """Returns a Polars expression matching *only* the ``code`` field of this predicate.
+
+        This is the code-membership half of :meth:`MEDS_eval_expr` factored out so that it can be
+        reused on its own (e.g. by the static audit tool in ``aces.audit``) to determine which codes
+        a predicate's ``code`` spec selects, independent of any ``value_min``/``value_max``/
+        ``other_cols`` constraints. :meth:`MEDS_eval_expr` calls this so the two never disagree.
+
+        The expression only references the ``code`` column, so it can be evaluated against a frame
+        that contains nothing but the code inventory.
+
+        Examples:
+            >>> print(PlainPredicateConfig("BP//systolic").code_matching_expr())
+            [(col("code")) == ("BP//systolic")]
+            >>> print(PlainPredicateConfig(code={'regex': '^foo.*'}).code_matching_expr())
+            col("code").str.contains(["^foo.*"])
+            >>> print(PlainPredicateConfig(code={'any': ['foo', 'bar']}).code_matching_expr())
+            col("code").is_in([["foo", "bar"]])
+            >>> PlainPredicateConfig(code={'regex': None, 'any': None}).code_matching_expr()
+            Traceback (most recent call last):
+                ...
+            ValueError: Only one of 'regex' or 'any' can be specified in the code field!
+            Got: ['regex', 'any'].
+        """
+        if isinstance(self.code, dict):
+            if len(self.code) > 1:
+                raise ValueError(
+                    "Only one of 'regex' or 'any' can be specified in the code field! "
+                    f"Got: {list(self.code.keys())}."
+                )
+
+            if "regex" in self.code:
+                if not self.code["regex"] or not isinstance(self.code["regex"], str):
+                    raise ValueError(
+                        "Invalid specification in the code field! "
+                        f"Got: {self.code}. "
+                        "Expected a non-empty string for 'regex'."
+                    )
+                return pl.col("code").str.contains(self.code["regex"])
+            elif "any" in self.code:
+                if not self.code["any"] or not isinstance(self.code["any"], list):
+                    raise ValueError(
+                        "Invalid specification in the code field! "
+                        f"Got: {self.code}. "
+                        f"Expected a list of strings for 'any'."
+                    )
+                return pl.Expr.is_in(pl.col("code"), self.code["any"])
+            else:
+                raise ValueError(
+                    "Invalid specification in the code field! "
+                    f"Got: {self.code}. "
+                    "Expected one of 'regex', 'any'."
+                )
+        else:
+            return pl.col("code") == self.code
+
     def MEDS_eval_expr(self) -> pl.Expr:
         """Returns a Polars expression that evaluates this predicate for a MEDS formatted dataset.
 
@@ -95,38 +151,7 @@ class PlainPredicateConfig:
             >>> print(PlainPredicateConfig(code={'any': ['foo', 'bar']}).MEDS_eval_expr())
             col("code").is_in([["foo", "bar"]])
         """
-        criteria = []
-        if isinstance(self.code, dict):
-            if len(self.code) > 1:
-                raise ValueError(
-                    "Only one of 'regex' or 'any' can be specified in the code field! "
-                    f"Got: {list(self.code.keys())}."
-                )
-
-            if "regex" in self.code:
-                if not self.code["regex"] or not isinstance(self.code["regex"], str):
-                    raise ValueError(
-                        "Invalid specification in the code field! "
-                        f"Got: {self.code}. "
-                        "Expected a non-empty string for 'regex'."
-                    )
-                criteria.append(pl.col("code").str.contains(self.code["regex"]))
-            elif "any" in self.code:
-                if not self.code["any"] or not isinstance(self.code["any"], list):
-                    raise ValueError(
-                        "Invalid specification in the code field! "
-                        f"Got: {self.code}. "
-                        f"Expected a list of strings for 'any'."
-                    )
-                criteria.append(pl.Expr.is_in(pl.col("code"), self.code["any"]))
-            else:
-                raise ValueError(
-                    "Invalid specification in the code field! "
-                    f"Got: {self.code}. "
-                    "Expected one of 'regex', 'any'."
-                )
-        else:
-            criteria.append(pl.col("code") == self.code)
+        criteria = [self.code_matching_expr()]
 
         if self.value_min is not None:
             if self.value_min_inclusive:

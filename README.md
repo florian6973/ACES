@@ -157,6 +157,48 @@ trigger
 2024-09-24 02:07:41.606 | INFO     | aces.__main__:main:188 - Completed in 0:00:44.243514. Results saved to 'sample_configs/inhospital_mortality.parquet'.
 ```
 
+## Auditing a Task Configuration (`aces-audit`)
+
+Because ACES offloads dataset-specific concepts to user-authored predicates, a predicate that
+references an absent code or the wrong vocabulary silently produces an all-zero column and an empty or
+wrong cohort — discovered only after a full extraction. `aces-audit` is a fast, **static** pre-flight
+check that profiles a MEDS dataset's code/vocabulary space and lints a task config's predicates
+against it *before* any extraction is run:
+
+```bash
+aces-audit --config path/to/task.yaml --meds path/to/meds_dataset
+```
+
+It flags predicates that reference codes, vocabularies, value constraints, or columns that do not
+exist in the dataset (e.g. a misspelled `code`, an `ICD9CM//…` predicate on a SNOMED-only dataset, or
+a value constraint on a value-less code), and lists high-prevalence codes that no predicate matches.
+Findings are severity-tiered (ERROR / WARNING / INFO); absence is surfaced for human review, not
+treated as a defect. Useful flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `--no-data-scan` | Lint against `metadata/codes.parquet` only (no prevalence/value scan); &lt; 5 s on any dataset. |
+| `--min-prevalence N` | Subject-count floor below which a matched predicate is flagged (default: 1). |
+| `--top-orphans N` | High-prevalence unmatched codes to surface per vocabulary (default: 25). |
+| `--json out.json` | Write the machine-readable report (deterministic, CI-friendly). |
+| `--profile-only` | Print just the dataset profile; do not lint a config. |
+
+The exit code makes it usable as a CI gate on a task-config repository: `0` = no errors, `1` = at
+least one ERROR finding, `2` = tool/input failure. The same checks are available from Python via
+`aces.audit`:
+
+```python
+from aces.audit import DatasetProfile, audit_config, run_audit
+
+report = run_audit("path/to/task.yaml", "path/to/meds_dataset")
+report.has_errors      # bool
+print(report.to_text())  # human-readable summary
+report.to_json()         # machine-readable report
+```
+
+See the [auditing documentation](https://eventstreamaces.readthedocs.io/en/latest/audit.html) for the
+full list of checks.
+
 ## Task Configuration File
 
 The task configuration file allows users to define specific predicates and windows to query your dataset. Below is a sample generic configuration file in its most basic form:

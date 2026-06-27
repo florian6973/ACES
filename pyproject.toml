@@ -51,6 +51,7 @@ aces = ["sample_configs/*.yaml", "_docs/*.md"]
 
 [project.scripts]
 aces-cli = "aces.run:cli"
+aces-audit = "aces.audit.cli:cli"
 expand_shards = "aces.expand_shards:main"
 
 [project.optional-dependencies]

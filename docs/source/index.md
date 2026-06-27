@@ -13,6 +13,7 @@ maxdepth: 2
 ---
 README <readme>
 Usage Guide <usage>
+Auditing Configs <audit>
 Task Examples <notebooks/examples>
 Predicates DataFrame <notebooks/predicates>
 MEDS Data Tutorial <notebooks/tutorial_meds>
