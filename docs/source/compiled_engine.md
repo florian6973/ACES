@@ -1,13 +1,16 @@
 # Compiled Polars Engine
 
-> Status: **implemented and opt-in, but NOT recommended for performance.** This document
-> specifies a new execution backend for ACES that *compiles* a task configuration into a
-> single fused Polars `LazyFrame` plan, as an alternative to the recursive interpreter in
-> [`extract_subtree.py`](../../src/aces/extract_subtree.py). It is fully correct (bit-for-bit
-> parity with the legacy engine, enforced by tests), but benchmarking showed it is **slower
-> and uses more memory** than the legacy engine at every size tested. See
-> [§6 Findings](#6-findings-measured). It ships behind `engine=compiled` for reproducibility
-> and as a foundation for the future, genuinely-optimized directions in [§7](#7-where-a-real-speedup-would-come-from).
+> Status: **implemented, opt-in (`engine=compiled`), bit-for-bit parity with the legacy
+> engine.** This is a new execution backend that *compiles* a task config into a fused Polars
+> `LazyFrame` plan, as an alternative to the recursive interpreter in
+> [`extract_subtree.py`](../../src/aces/extract_subtree.py).
+>
+> **Performance is config-shape-dependent** (see [§6](#6-findings-measured)). After the
+> flattening optimization in [§6.2](#62-the-flattening-optimization), the compiled engine is
+> **faster than legacy on temporal-heavy and wide configs** (≈0.3–0.85× of legacy time and
+> linear in window count), but is **still slower on event-bound-heavy configs** because the
+> event-bound window aggregation has no flattening yet. The naive (pre-flattening) compile
+> was catastrophically super-linear on deep window chains; that is fixed.
 
 ## 1. Motivation
 
@@ -138,79 +141,88 @@ Parity is enforced by a **differential oracle**: the legacy engine *is* the spec
   the full `mode × closed × offset × end_event` matrix on fixed and randomized frames
   (216 cases). This is where the highest-risk `boolean_expr_bound_sum` port is verified.
 - [`tests/test_compiled_parity.py`](../../tests/test_compiled_parity.py): for every
-  `sample_configs/*.yaml` and multiple seeds, runs both `query(cfg, df)` and
-  `lazy_query(cfg, df)` and `assert_frame_equal` after a canonical sort.
+  `sample_configs/*.yaml`, multiple seeds, **and** parametric many-window `chain`/`wide`
+  configs ([`benchmarks/complex_configs.py`](../../benchmarks/complex_configs.py)), runs both
+  `query(cfg, df)` and `lazy_query(cfg, df)` and `assert_frame_equal` after a canonical sort.
+  The complex configs specifically guard the flattening optimization (§6.2).
 
 A streaming-unsupported op triggers an automatic fallback to in-memory `.collect()` in
 [`lazy_query`](../../src/aces/lazy_query.py).
 
 ## 6. Findings (measured)
 
-Synthetic sweep (seed 0, 50 events/subject) on this machine (Windows, Polars 1.40), each
-engine run in an **isolated subprocess** so peak working set is attributable to that engine
-alone. Raw data: [`benchmarks/results/isolated.csv`](../../benchmarks/results) and the
-`*_seconds.png` / `*_peak_wset_mb.png` plots beside it.
+All numbers from synthetic sweeps (seed 0, 50 events/subject) on this machine (Windows,
+Polars 1.40). Reproduce with [`benchmarks/run_isolated.py`](../../benchmarks/run_isolated.py)
+(isolated-subprocess peak memory) and [`benchmarks/complex_configs.py`](../../benchmarks/complex_configs.py)
+(window-count scaling).
 
-`inhospital_mortality` (event-bound-heavy: `-_RECORD_START`, `-> discharge_or_death`):
+### 6.1 The naive compile is super-linear in tree *depth*
 
-| subjects | pred rows | engine | time (s) | peak mem (MB) |
+The first version of the compiler was a faithful unrolling of `extract_subtree`: it mirrored
+the recursion into a deep cascade of joins inside one lazy plan. That cascade is fine when
+the tree is **wide** (windows hanging off the trigger) but pathological when it is **deep**
+(a chain of windows each starting where the previous ended). On a temporal chain at 20 k
+subjects:
+
+| windows | legacy (s) | naive-compiled (s) | flattened-compiled (s) |
+| --- | --- | --- | --- |
+| 1 | 0.12 | 0.08 | **0.04** |
+| 8 | 0.72 | 1.84 | **0.27** |
+| 16 | 1.40 | 7.09 | **0.64** |
+| 24 | 2.11 | 15.05 | **1.04** |
+| 32 | 2.80 | 27.84 | **1.34** |
+
+Legacy is linear in depth (it materializes each node and frees it); the naive compile blows
+up super-linearly because the whole nested join graph stays live in one plan. Wide configs,
+by contrast, stayed linear and the naive compile was already ≈0.8× of legacy.
+
+### 6.2 The flattening optimization
+
+The fix exploits a structural fact: a **temporal** window keeps the *same anchor timestamp*
+as its parent, so a chain of temporal windows all share one anchor (the trigger time) and do
+**not** need nesting. [`_process_children`](../../src/aces/compile.py) therefore *flattens*
+temporal edges — joining each window summary onto a single accumulating frame keyed by the
+trigger anchor — and only *nests* at **event-bound** edges, which genuinely move the anchor
+to a realized boundary event. This restores linear scaling (right column above): at depth 32
+it is **20× faster than the naive compile and ≈2× faster than legacy**, with bit-for-bit
+identical output (parity tests green).
+
+### 6.3 Where the compiled engine now stands vs legacy
+
+| config (80 k subjects, 4.08 M rows) | shape | legacy (s) | compiled (s) | ratio |
 | --- | --- | --- | --- | --- |
-| 80,000 | 4.08 M | legacy | **2.06** | **2,788** |
-| 80,000 | 4.08 M | compiled (streaming) | 3.71 | 4,115 |
-| 80,000 | 4.08 M | compiled (in-memory) | 2.75 | 3,352 |
-| 200,000 | 10.2 M | legacy | **8.15** | **6,615** |
-| 200,000 | 10.2 M | compiled (streaming) | 12.23 | 9,706 |
-| 200,000 | 10.2 M | compiled (in-memory) | 8.66 | 8,590 |
+| temporal chain ×32 | deep temporal | 2.71 | **1.34** | 0.49× |
+| `readmission_risk` | shallow | 1.19 | **1.01** | 0.85× |
+| `inhospital_mortality` | event-bound-heavy | **1.91** | 3.99 | 2.09× |
 
-`readmission_risk` (lighter, larger output):
+So after flattening the compiled engine **wins on temporal-heavy and wide configs** and
+**loses on event-bound-heavy configs**. The remaining gap is entirely in the event-bound
+window summary: those edges still nest *and* run the faithful, full-frame
+`boolean_expr_bound_sum` port (a `concat` + `sort` + windowed `fill_null` over the whole
+frame per event-bound window). Memory tracks time — the compiled engine is leaner where it
+is faster and heavier where it is slower; the earlier isolated peak-RSS sweep
+([`benchmarks/results/isolated.csv`](../../benchmarks/results)) was taken on the
+event-bound-heavy `inhospital_mortality`/`readmission_risk` pair *before* flattening and
+should be re-run for the current numbers.
 
-| subjects | pred rows | engine | time (s) | peak mem (MB) |
-| --- | --- | --- | --- | --- |
-| 200,000 | 10.2 M | legacy | **3.11** | **4,123** |
-| 200,000 | 10.2 M | compiled (streaming) | 9.47 | 4,406 |
-| 200,000 | 10.2 M | compiled (in-memory) | 8.12 | 5,580 |
+## 7. Remaining optimization levers
 
-**The legacy engine wins on both time and memory at every size tested.** The compiled
-streaming engine is consistently the slowest and the most memory-hungry. Why:
+Flattening (§6.2) is done. The next wins are all about the **event-bound** path and avoiding
+full-frame work:
 
-1. **No work is saved.** The compiled plan is a faithful translation of the recursion, so
-   it performs the same aggregations and joins — there is no algorithmic reduction for the
-   query optimizer to exploit, and the per-window summary contract forces every predicate
-   column through every window (so projection pushdown can't prune them).
-2. **Fusing removes free memory checkpoints.** The interpreter materializes one node's
-   `DataFrame`, uses it, and lets Python free it before the next node. Collapsing the whole
-   tree into one plan keeps far more intermediate state live simultaneously, *raising* peak
-   memory rather than lowering it.
-3. **Streaming overhead without streaming benefit.** Nothing spills at ≤10 M rows, so the
-   streaming engine's morsel/pipeline machinery is pure overhead on this self-join- and
-   struct-heavy plan.
-
-The 106 GB peaks in [`profiling.md`](profiling.md) therefore are **not** explained by
-"materializing at every node" — that materialization is actually load-bearing for keeping
-memory bounded.
-
-## 7. Where a real speedup would come from
-
-A faithful compile cannot beat the interpreter; it does the same work with less freedom to
-release memory. A genuinely faster engine would need *algorithmic* changes, not just lazy
-translation:
-
-- **Per-window column projection.** Only compute the predicate counts a window's
-  constraints/label actually reference, instead of all predicates for all windows (requires
-  changing the "every window summarizes every predicate" output contract, or computing the
-  full summary lazily only for surviving rows).
-- **Avoid full-frame re-aggregation per node.** Both engines aggregate over the entire frame
-  at each node; restricting aggregation to the neighborhoods of surviving anchors before
-  summarizing would cut work super-linearly on selective tasks.
-- **Early subject pruning.** Drop subjects that cannot satisfy a constraint before
-  descending, shrinking every downstream aggregation.
-- **Chunked/streamed-by-subject execution** for the genuine out-of-core regime (the only
-  place streaming should help), measured against real MIMIC-scale data rather than synthetic
-  ≤10 M-row frames.
-
-These are out of scope for the faithful-parity engine landed here, which exists to (a)
-establish the differential oracle and benchmark harness and (b) make the negative result
-reproducible.
+- **Cumulative-sum + as-of join for window summaries.** Precompute per-subject prefix sums of
+  each predicate *once*, then express every temporal/event-bound window count as a
+  cumsum-difference located by as-of joins on the (small) anchor set — sharing the single
+  heavy pass across all windows instead of one full-frame rolling / `boolean_expr_bound_sum`
+  per window. This is the structure hand-written Polars uses and is the most promising lever
+  for the event-bound configs.
+- **Per-window column projection.** Only compute the predicate counts a window actually
+  references rather than all predicates for all windows (needs the "every window summarizes
+  every predicate" output contract relaxed, or the full summary computed lazily only for
+  surviving rows).
+- **Early subject pruning.** Drop subjects that cannot satisfy a constraint before descending.
+- **Out-of-core, by-subject streaming**, measured against real MIMIC-scale data rather than
+  synthetic ≤10 M-row frames — the only regime where the streaming engine should help.
 
 ## 8. Edge cases handled (parity-verified)
 

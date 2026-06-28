@@ -25,6 +25,7 @@ SAMPLE_CONFIGS = sorted((REPO_ROOT / "sample_configs").glob("*.yaml"))
 
 # Make ``benchmarks/generate.py`` importable without packaging it.
 sys.path.insert(0, str(REPO_ROOT))
+from benchmarks.complex_configs import chain_config, wide_config  # noqa: E402
 from benchmarks.generate import generate_predicates_df  # noqa: E402
 
 
@@ -60,6 +61,21 @@ def test_sample_config_parity(config_path: Path) -> None:
 def test_inhospital_mortality_multiseed(seed: int) -> None:
     cfg = TaskExtractorConfig.load(str(REPO_ROOT / "sample_configs" / "inhospital_mortality.yaml"))
     predicates_df = generate_predicates_df(cfg, n_subjects=40, events_per_subject=50, seed=seed)
+    assert_engines_match(cfg, predicates_df)
+
+
+@pytest.mark.parametrize("shape", ["chain", "wide"])
+@pytest.mark.parametrize("n_windows", [1, 3, 8])
+@pytest.mark.parametrize("constrain", [False, True])
+def test_complex_config_parity(shape: str, n_windows: int, constrain: bool) -> None:
+    """Deep/wide multi-window configs: guards the flattening optimization in compile.py.
+
+    The compiler flattens temporal subtrees (which share an anchor) instead of nesting
+    them; these many-window trees are what exercise — and previously broke — that path.
+    """
+    builder = chain_config if shape == "chain" else wide_config
+    cfg = builder(n_windows, constrain=constrain)
+    predicates_df = generate_predicates_df(cfg, n_subjects=80, events_per_subject=40, seed=5)
     assert_engines_match(cfg, predicates_df)
 
 

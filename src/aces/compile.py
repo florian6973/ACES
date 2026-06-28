@@ -77,107 +77,109 @@ def _accumulate_offset(endpoint_expr, offset: timedelta):
     return dataclasses.replace(endpoint_expr, offset=endpoint_expr.offset + offset)
 
 
-def _compile_subtree(
-    subtree: Node,
-    anchor_lf: pl.LazyFrame,
+def _window_summary_struct(name: str, predicate_cols: list[str]) -> pl.Expr:
+    return pl.struct(
+        pl.lit(name).alias("window_name"),
+        "timestamp_at_start",
+        "timestamp_at_end",
+        *predicate_cols,
+    ).alias(f"{name}_summary")
+
+
+def _process_children(
+    node: Node,
+    cur: pl.LazyFrame,
     predicates_lf: pl.LazyFrame,
     predicate_cols: list[str],
     offset: timedelta = timedelta(0),
 ) -> pl.LazyFrame:
-    """Lazy, compile-time unrolling of :func:`aces.extract_subtree.extract_subtree`.
+    """Compile every edge in ``node``'s subtree onto ``cur``, *flattening* where possible.
 
-    ``anchor_lf`` is keyed by ``(subject_id, subtree_anchor_timestamp)``. Returns a
-    ``LazyFrame`` keyed the same way, with one ``<window>_summary`` struct column per
-    descendant window.
+    ``cur`` is keyed by ``(subject_id, subtree_anchor_timestamp)`` in ``node``'s anchor
+    space (the timestamps that realize ``node``), and already carries the ``<window>_summary``
+    structs for edges processed so far. The return value extends it with a summary column
+    for every descendant edge, still keyed in ``node``'s anchor space, with rows restricted
+    to anchors for which the whole subtree has a valid realization.
+
+    The key optimization over a faithful unrolling of
+    :func:`aces.extract_subtree.extract_subtree`: a **temporal** child keeps the same anchor
+    timestamp as its parent, so its window can be joined on *flat* and its own children
+    processed in the same anchor space — no nested anchor remap. Only **event-bound** edges
+    (which move the anchor to a realized boundary event) require the nested
+    remap-back-to-parent logic. This turns the deep join cascade the naive compile produced
+    on long temporal chains (super-linear) back into a linear, flat sequence of joins.
     """
-    if not subtree.children:
-        return anchor_lf
-
-    recursive_results: list[pl.LazyFrame] = []
-    for child in subtree.children:
+    for child in node.children:
         endpoint_expr = _accumulate_offset(child.endpoint_expr, offset)
 
-        # Step 1: summarize the window from the subtree root to this child.
         if isinstance(endpoint_expr, TemporalWindowBounds):
-            child_root_offset = offset + endpoint_expr.window_size
-            window_summary = (
-                summarize_temporal_window(predicates_lf, endpoint_expr)
-                .with_columns(
-                    pl.col("timestamp").alias("subtree_anchor_timestamp"),
-                    pl.col("timestamp").alias("child_anchor_timestamp"),
-                )
-                .drop("timestamp")
+            # Temporal edge: anchor unchanged -> flatten. Join the window summary directly
+            # onto cur, filter constraints in place, attach the struct, and recurse into the
+            # child's own children in this same anchor space (offset accumulates window_size).
+            child_offset = offset + endpoint_expr.window_size
+            summary = summarize_temporal_window(predicates_lf, endpoint_expr).rename(
+                {"timestamp": "subtree_anchor_timestamp"}
             )
+            cur = cur.join(summary, on=["subject_id", "subtree_anchor_timestamp"], how="inner")
+            if child.constraints:
+                cur = cur.filter(_constraint_keep_expr(child.constraints))
+            cur = cur.with_columns(_window_summary_struct(child.name, predicate_cols)).drop(
+                "timestamp_at_start", "timestamp_at_end", *predicate_cols
+            )
+            cur = _process_children(child, cur, predicates_lf, predicate_cols, child_offset)
+
         elif isinstance(endpoint_expr, ToEventWindowBounds):
-            # The child root is an extant event, so it is its own anchor (zero offset).
-            child_root_offset = timedelta(0)
+            # Event-bound edge: anchor moves to a realized boundary event -> nest. Build the
+            # child subtree in child-anchor space, then remap it back to this anchor space.
             child_anchor_time = (
                 "timestamp_at_start" if endpoint_expr.end_event.startswith("-") else "timestamp_at_end"
             )
-            window_summary = (
+            ws = (
                 summarize_event_bound_window(predicates_lf, endpoint_expr)
                 .with_columns(
                     pl.col("timestamp").alias("subtree_anchor_timestamp"),
                     pl.col(child_anchor_time).alias("child_anchor_timestamp"),
                 )
                 .drop("timestamp")
+                .join(
+                    cur.select("subject_id", "subtree_anchor_timestamp").unique(maintain_order=True),
+                    on=["subject_id", "subtree_anchor_timestamp"],
+                    how="inner",
+                )
             )
+            if child.constraints:
+                ws = ws.filter(_constraint_keep_expr(child.constraints))
+
+            child_base = ws.select(
+                "subject_id", pl.col("child_anchor_timestamp").alias("subtree_anchor_timestamp")
+            ).unique(maintain_order=True)
+            child_res = _process_children(child, child_base, predicates_lf, predicate_cols, timedelta(0))
+
+            # Lift the child subtree back into this anchor space and attach the edge's summary.
+            child_res = (
+                child_res.rename({"subtree_anchor_timestamp": "child_anchor_timestamp"})
+                .join(
+                    ws.select("subject_id", "subtree_anchor_timestamp", "child_anchor_timestamp"),
+                    on=["subject_id", "child_anchor_timestamp"],
+                    how="left",
+                )
+                .drop("child_anchor_timestamp")
+                .join(
+                    ws.select(
+                        "subject_id",
+                        "subtree_anchor_timestamp",
+                        _window_summary_struct(child.name, predicate_cols),
+                    ),
+                    on=["subject_id", "subtree_anchor_timestamp"],
+                    how="left",
+                )
+            )
+            cur = cur.join(child_res, on=["subject_id", "subtree_anchor_timestamp"], how="inner")
+
         else:  # pragma: no cover - guarded by config parsing
             raise ValueError(f"Invalid endpoint expression: '{endpoint_expr}'")
 
-        # Step 2: restrict to valid subtree anchors.
-        window_summary = window_summary.join(
-            anchor_lf, on=["subject_id", "subtree_anchor_timestamp"], how="inner"
-        )
-
-        # Step 3: enforce this window's constraints.
-        if child.constraints:
-            window_summary = window_summary.filter(_constraint_keep_expr(child.constraints))
-
-        # Step 4: the surviving child-anchor timestamps become the next subtree anchors.
-        child_anchor_realizations = window_summary.select(
-            "subject_id",
-            pl.col("child_anchor_timestamp").alias("subtree_anchor_timestamp"),
-        ).unique(maintain_order=True)
-
-        # Step 5: recurse.
-        recursive_result = _compile_subtree(
-            child, child_anchor_realizations, predicates_lf, predicate_cols, child_root_offset
-        )
-
-        # Step 6.1: lift the recursive result back into this subtree's anchor space.
-        recursive_result = (
-            recursive_result.rename({"subtree_anchor_timestamp": "child_anchor_timestamp"})
-            .join(
-                window_summary.select(
-                    "subject_id", "subtree_anchor_timestamp", "child_anchor_timestamp"
-                ),
-                on=["subject_id", "child_anchor_timestamp"],
-                how="left",
-            )
-            .drop("child_anchor_timestamp")
-        )
-
-        # Step 6.2: attach this window's summary struct.
-        for_return = window_summary.select(
-            "subject_id",
-            "subtree_anchor_timestamp",
-            pl.struct(
-                pl.lit(child.name).alias("window_name"),
-                "timestamp_at_start",
-                "timestamp_at_end",
-                *predicate_cols,
-            ).alias(f"{child.name}_summary"),
-        )
-        recursive_results.append(
-            recursive_result.join(for_return, on=["subject_id", "subtree_anchor_timestamp"], how="left")
-        )
-
-    # Step 7: a valid realization requires every child branch to succeed.
-    all_children = recursive_results[0]
-    for df in recursive_results[1:]:
-        all_children = all_children.join(df, on=["subject_id", "subtree_anchor_timestamp"], how="inner")
-    return all_children
+    return cur
 
 
 def compile_query(cfg: TaskExtractorConfig) -> CompiledPlan:
@@ -202,7 +204,7 @@ def compile_query(cfg: TaskExtractorConfig) -> CompiledPlan:
             _constraint_keep_expr({cfg.trigger.predicate: (1, None)})
         ).select("subject_id", pl.col("timestamp").alias("subtree_anchor_timestamp"))
 
-        result = _compile_subtree(cfg.window_tree, root_anchors, predicates_lf, predicate_cols)
+        result = _process_children(cfg.window_tree, root_anchors, predicates_lf, predicate_cols)
         result = result.rename({"subtree_anchor_timestamp": "trigger"})
 
         to_return_cols = [
