@@ -1,19 +1,27 @@
 """This module contains functions for generating predicate columns for event sequences."""
 
 import logging
+from datetime import timedelta
 from pathlib import Path
 
 import polars as pl
 from omegaconf import DictConfig
 from polars.exceptions import ColumnNotFoundError
 
-from .config import PlainPredicateConfig, TaskExtractorConfig
+from .aggregate import aggregate_temporal_window
+from .config import (
+    PlainPredicateConfig,
+    TaskExtractorConfig,
+    WithinPredicateConfig,
+)
 from .types import (
     ANY_EVENT_COLUMN,
     END_OF_RECORD_KEY,
     PRED_CNT_TYPE,
     START_OF_RECORD_KEY,
+    TemporalWindowBounds,
 )
+from .utils import parse_timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -474,6 +482,80 @@ def generate_plain_predicates_from_esgpt(data_path: Path, predicates: dict) -> p
     return process_esgpt_data(subjects_df, events_df, dynamic_measurements_df, value_columns, predicates)
 
 
+def add_within_predicate(data: pl.DataFrame, name: str, cfg: WithinPredicateConfig) -> pl.DataFrame:
+    """Add a ``within`` relational predicate column to a sorted predicates dataframe.
+
+    ``within(e)`` is 1 iff ``cfg.event`` holds at the row and at least one ``cfg.of`` event occurs in the
+    closed offset window ``[e.time - cfg.before, e.time + cfg.after]``. This is a temporal proximity (range)
+    join, computed by summing the ``of`` column over that temporal window per subject.
+
+    Args:
+        data: The predicates dataframe, sorted ascending by ``timestamp`` within each ``subject_id`` group.
+            Must already contain the ``cfg.event`` and ``cfg.of`` predicate columns.
+        name: The output predicate column name.
+        cfg: The :class:`aces.config.WithinPredicateConfig` defining the relation.
+
+    Returns:
+        ``data`` with an added 0/1 integer column ``name``, re-sorted by ``(subject_id, timestamp)``.
+
+    Examples:
+        >>> data = pl.DataFrame({
+        ...     "subject_id": [1, 1, 1, 1, 1],
+        ...     "timestamp": [
+        ...         datetime(2020, 1, 1),    # smoking
+        ...         datetime(2020, 1, 6),    # cs4, smoking within 10d -> 1
+        ...         datetime(2020, 3, 1),    # cs4, no smoking nearby   -> 0
+        ...         datetime(2020, 4, 18),   # smoking
+        ...         datetime(2020, 4, 25),   # cs4, smoking within 10d  -> 1
+        ...     ],
+        ...     "cs4":     [0, 1, 1, 0, 1],
+        ...     "smoking": [1, 0, 0, 1, 0],
+        ... })
+        >>> cfg = WithinPredicateConfig(event="cs4", of="smoking", before="10d", after="10d")
+        >>> add_within_predicate(data, "cs4_smk", cfg).select("timestamp", "cs4_smk")
+        shape: (5, 2)
+        ┌─────────────────────┬─────────┐
+        │ timestamp           ┆ cs4_smk │
+        │ ---                 ┆ ---     │
+        │ datetime[μs]        ┆ i64     │
+        ╞═════════════════════╪═════════╡
+        │ 2020-01-01 00:00:00 ┆ 0       │
+        │ 2020-01-06 00:00:00 ┆ 1       │
+        │ 2020-03-01 00:00:00 ┆ 0       │
+        │ 2020-04-18 00:00:00 ┆ 0       │
+        │ 2020-04-25 00:00:00 ┆ 1       │
+        └─────────────────────┴─────────┘
+    """
+    before = parse_timedelta(cfg.before)
+    after = parse_timedelta(cfg.after)
+    event_present = pl.col(cfg.event) > 0
+
+    # A degenerate zero-width window reduces to "an ``of`` event at the same timestamp", which avoids handing
+    # polars a zero-length rolling period.
+    if before == timedelta(0) and after == timedelta(0):
+        return data.with_columns((event_present & (pl.col(cfg.of) > 0)).cast(PRED_CNT_TYPE).alias(name))
+
+    of_count_col = "__aces_within_of_count"
+    bounds = TemporalWindowBounds(
+        left_inclusive=True, window_size=after + before, right_inclusive=True, offset=-before
+    )
+    # Rolling aggregation needs non-null timestamps; static (null-timestamp) rows carry no events and are
+    # rejoined as 0 below.
+    present = data.filter(pl.col("timestamp").is_not_null()).select(
+        "subject_id", "timestamp", pl.col(cfg.of).alias(of_count_col)
+    )
+    of_counts = aggregate_temporal_window(present, bounds).select("subject_id", "timestamp", of_count_col)
+
+    return (
+        data.join(of_counts, on=["subject_id", "timestamp"], how="left")
+        .sort(by=["subject_id", "timestamp"], nulls_last=False)
+        .with_columns(
+            (event_present & (pl.col(of_count_col).fill_null(0) > 0)).cast(PRED_CNT_TYPE).alias(name)
+        )
+        .drop(of_count_col)
+    )
+
+
 def get_predicates_df(cfg: TaskExtractorConfig, data_config: DictConfig) -> pl.DataFrame:
     """Generate predicate columns based on the configuration.
 
@@ -721,6 +803,16 @@ def get_predicates_df(cfg: TaskExtractorConfig, data_config: DictConfig) -> pl.D
     logger.info("Loaded plain predicates. Generating derived predicate columns...")
     static_variables = [pred for pred in cfg.plain_predicates if cfg.plain_predicates[pred].static]
     for name, code in cfg.derived_predicates.items():
+        # ``within`` relational predicates need the full sorted frame (a temporal range join), not a
+        # per-row expression, so they are materialized through a dedicated helper.
+        if isinstance(code, WithinPredicateConfig):
+            data = add_within_predicate(data, name, code)
+            logger.info(f"Added predicate column '{name}'.")
+            predicate_cols.append(name)
+            continue
+
+        # ``DerivedPredicateConfig`` and ``DuringPredicateConfig`` are both pure per-row expressions over
+        # existing predicate columns (the latter via a cumulative net-open count scoped by ``subject_id``).
         if any(x in static_variables for x in code.input_predicates):
             data = data.with_columns(
                 [

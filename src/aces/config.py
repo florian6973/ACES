@@ -315,6 +315,157 @@ class DerivedPredicateConfig:
         return False
 
 
+# The inclusivity conventions accepted by ``DuringPredicateConfig.closed``.
+DURING_CLOSED_OPTIONS = ("both", "left", "right", "none")
+
+
+@dataclasses.dataclass
+class DuringPredicateConfig:
+    """A relational predicate that holds for events occurring inside a reconstructed open/close interval.
+
+    ``during`` defines a 0/1 *monadic* predicate column from a temporal relation to other events:
+    ``during(e)`` is true iff ``event(e)`` holds **and** ``e``'s timestamp lies inside an open interval
+    ``[opens ... closes]``. Intervals are reconstructed from the (unpaired) ``opens`` and ``closes`` boundary
+    predicates via the **net-open count** -- an event is "admitted" at time ``τ`` iff the number of ``opens``
+    at-or-before ``τ`` strictly exceeds the number of ``closes`` before ``τ`` (the exact ``≤``/``<`` edges
+    follow ``closed``). This is exact for non-overlapping stays; for nested/overlapping stays it is the
+    "currently admitted" semantics.
+
+    Args:
+        event: The predicate restricting which events this predicate can hold for.
+        opens: The interval-open boundary predicate.
+        closes: The interval-close boundary predicate.
+        closed: The inclusivity of the reconstructed ``[opens, closes]`` interval; one of ``both`` (default),
+            ``left``, ``right``, or ``none``.
+
+    Raises:
+        ValueError: If ``closed`` is not one of the accepted options.
+
+    Examples:
+        >>> cfg = DuringPredicateConfig(event="ami", opens="adm", closes="dis")
+        >>> cfg.closed
+        'both'
+        >>> sorted(cfg.input_predicates)
+        ['adm', 'ami', 'dis']
+        >>> cfg.is_plain
+        False
+        >>> DuringPredicateConfig(event="ami", opens="adm", closes="dis", closed="foo")
+        Traceback (most recent call last):
+            ...
+        ValueError: 'closed' must be one of 'both', 'left', 'right', 'none'. Got: 'foo'
+    """
+
+    event: str
+    opens: str
+    closes: str
+    closed: str = "both"
+    static: bool = False
+
+    def __post_init__(self) -> None:
+        if self.closed not in DURING_CLOSED_OPTIONS:
+            raise ValueError(f"'closed' must be one of 'both', 'left', 'right', 'none'. Got: '{self.closed}'")
+
+    @property
+    def input_predicates(self) -> list[str]:
+        return [self.event, self.opens, self.closes]
+
+    @property
+    def is_plain(self) -> bool:
+        return False
+
+    def eval_expr(self) -> pl.Expr:
+        """Return a Polars expression evaluating this predicate from the boundary predicate columns.
+
+        The expression is a 0/1 (boolean) expression over the ``event``, ``opens``, and ``closes`` columns
+        plus the ``subject_id`` column (used to scope the cumulative net-open count). It assumes the frame is
+        sorted ascending by timestamp within each ``subject_id`` group, which is the invariant maintained by
+        :func:`aces.predicates.get_predicates_df` before derived predicates are computed.
+        """
+        opens = pl.col(self.opens)
+        closes = pl.col(self.closes)
+        opens_cum = opens.cum_sum().over("subject_id")
+        closes_cum = closes.cum_sum().over("subject_id")
+
+        # ``opens`` at-or-before τ when the open boundary is inclusive (both/left), strictly before otherwise.
+        opens_term = opens_cum if self.closed in ("both", "left") else opens_cum - opens
+        # ``closes`` strictly before τ when the close boundary is inclusive (both/right) -- the close at τ has
+        # not yet ended the interval, so τ is still inside -- and at-or-before τ otherwise.
+        closes_term = closes_cum - closes if self.closed in ("both", "right") else closes_cum
+
+        admitted = (opens_term - closes_term) > 0
+        return (pl.col(self.event) > 0) & admitted
+
+
+@dataclasses.dataclass
+class WithinPredicateConfig:
+    """A relational predicate that holds for events with a corroborating event in a fixed offset window.
+
+    ``within`` defines a 0/1 *monadic* predicate column from temporal proximity to other events:
+    ``within(e)`` is true iff ``event(e)`` holds **and** there exists an ``of``-event whose timestamp lies in
+    ``[e.time - before, e.time + after]``. Unlike :class:`DuringPredicateConfig`, this is a pure range join --
+    there is no interval reconstruction and hence no overlap/pairing ambiguity.
+
+    Args:
+        event: The predicate restricting which events this predicate can hold for.
+        of: The corroborating predicate that must occur within the offset window.
+        before: How far back to look from each ``event`` occurrence, as a timedelta string (e.g. ``365d``).
+            Defaults to zero (one-sided forward window).
+        after: How far forward to look from each ``event`` occurrence, as a timedelta string. Defaults to
+            zero (one-sided backward window).
+
+    Examples:
+        >>> cfg = WithinPredicateConfig(event="cs4", of="smoking", before="365d", after="365d")
+        >>> sorted(cfg.input_predicates)
+        ['cs4', 'smoking']
+        >>> cfg.is_plain
+        False
+        >>> WithinPredicateConfig(event="cs4", of="smoking").before is None
+        True
+    """
+
+    event: str
+    of: str
+    before: str | None = None
+    after: str | None = None
+    static: bool = False
+
+    @property
+    def input_predicates(self) -> list[str]:
+        return [self.event, self.of]
+
+    @property
+    def is_plain(self) -> bool:
+        return False
+
+
+def _predicate_input_names(pred_def: dict[str, Any]) -> list[str]:
+    """Return the predicate names a raw (dict) predicate definition depends on.
+
+    Plain predicates depend on nothing; derived (``expr``) and relational (``during`` / ``within``) predicates
+    depend on the predicates they reference. This is used during config loading to transitively pull every
+    referenced predicate into the parse/validation set.
+
+    Examples:
+        >>> _predicate_input_names({"code": "foo"})
+        []
+        >>> _predicate_input_names({"expr": "and(a, b)"})
+        ['a', 'b']
+        >>> _predicate_input_names({"during": {"event": "ami", "opens": "adm", "closes": "dis"}})
+        ['ami', 'adm', 'dis']
+        >>> _predicate_input_names({"within": {"event": "cs4", "of": "smoking"}})
+        ['cs4', 'smoking']
+    """
+    if "expr" in pred_def:
+        return list(DerivedPredicateConfig(expr=pred_def["expr"]).input_predicates)
+    if "during" in pred_def:
+        d = pred_def["during"]
+        return [d["event"], d["opens"], d["closes"]]
+    if "within" in pred_def:
+        w = pred_def["within"]
+        return [w["event"], w["of"]]
+    return []
+
+
 @dataclasses.dataclass
 class WindowConfig:
     """A configuration object for defining a window in the task extraction process.
@@ -385,6 +536,10 @@ class WindowConfig:
             'index_timestamp' is specified, an error is raised. If the specified 'index_timestamp' is not
             'start' or 'end', an error is also raised. If no 'index_timestamp' is defined, there will be no
             'index_timestamp' column.
+        has_any: A disjunction of constraint blocks; the window is valid iff *at least one* block holds.
+            Each block is itself an ordinary (conjunctive) `has` dictionary (every constraint in the block
+            must hold). This is the single OR connective that the conjunctive `has` cannot express. `has` and
+            `has_any` are mutually exclusive on the same window.
 
     Raises:
         ValueError: If the window is misconfigured in any of a variety of ways; see below for examples.
@@ -616,6 +771,29 @@ class WindowConfig:
             ...
         ValueError: Invalid constraint format: discharge.
         Expected format: '(min, max)'. Got: '(0)'
+
+        A ``has_any`` window is satisfied by *any* one of its constraint blocks (a disjunction). The block
+        constraints are parsed exactly like ``has``, and every referenced predicate is collected:
+        >>> any_window = WindowConfig(
+        ...     start=None,
+        ...     end="trigger",
+        ...     start_inclusive=True,
+        ...     end_inclusive=True,
+        ...     has_any=[{"cs13": "(1, None)"}, {"cs4": "(2, None)"}, {"cs4_smk": "(1, None)"}],
+        ... )
+        >>> any_window.has_any
+        [{'cs13': (1, None)}, {'cs4': (2, None)}, {'cs4_smk': (1, None)}]
+        >>> sorted(any_window.referenced_predicates)
+        ['cs13', 'cs4', 'cs4_smk']
+
+        ``has`` and ``has_any`` may not be combined on the same window:
+        >>> WindowConfig(
+        ...     start=None, end="trigger", start_inclusive=True, end_inclusive=True,
+        ...     has={"cs4": "(1, None)"}, has_any=[{"cs13": "(1, None)"}],
+        ... )
+        Traceback (most recent call last):
+            ...
+        ValueError: A window may specify 'has' or 'has_any', but not both.
     """
 
     start: str | None
@@ -625,6 +803,7 @@ class WindowConfig:
     has: dict[str, str] = field(default_factory=dict)
     label: str | None = None
     index_timestamp: str | None = None
+    has_any: list[dict[str, str]] | None = None
 
     @classmethod
     def _check_reference(cls, reference: str) -> None:
@@ -688,20 +867,34 @@ class WindowConfig:
             cls._check_reference(ref)
             return {"referenced": ref, "offset": None, "event_bound": None, "occurs_before": None}
 
+    @staticmethod
+    def _parse_constraints(constraints: dict[str, str]) -> dict[str, tuple[int | None, int | None]]:
+        """Parse a ``{predicate: '(min, max)'}`` constraint block into ``{predicate: (min, max)}`` tuples."""
+        parsed = {}
+        for name, raw in constraints.items():
+            elements = [element.strip() for element in raw.strip("()").split(",")]
+            if len(elements) != 2:
+                raise ValueError(
+                    f"Invalid constraint format: {name}. Expected format: '(min, max)'. Got: '{raw}'"
+                )
+            parsed[name] = tuple(
+                int(element) if element not in ("None", "") else None for element in elements
+            )
+        return parsed
+
     def __post_init__(self) -> None:
         # Parse the has constraints from the string representation to the tuple representation
         if self.has is not None:
-            for each_constraint in self.has:
-                elements = self.has[each_constraint].strip("()").split(",")
-                elements = [element.strip() for element in elements]
-                if len(elements) != 2:
-                    raise ValueError(
-                        f"Invalid constraint format: {each_constraint}. "
-                        f"Expected format: '(min, max)'. Got: '{self.has[each_constraint]}'"
-                    )
-                self.has[each_constraint] = tuple(
-                    int(element) if element not in ("None", "") else None for element in elements
-                )
+            self.has = self._parse_constraints(self.has)
+
+        # ``has_any`` is a disjunction of constraint blocks (the OR that the conjunctive ``has`` cannot
+        # express). Each block is itself an ordinary (conjunctive) ``has``. The two are mutually exclusive.
+        if self.has_any is not None:
+            if not isinstance(self.has_any, list):
+                raise ValueError("'has_any' must be a list of constraint blocks (dictionaries).")
+            if self.has:
+                raise ValueError("A window may specify 'has' or 'has_any', but not both.")
+            self.has_any = [self._parse_constraints(block) for block in self.has_any]
 
         if self.start is None and self.end is None:
             raise ValueError("Window cannot progress from the start of the record to the end of the record.")
@@ -766,11 +959,14 @@ class WindowConfig:
     @property
     def constraint_predicates(self) -> set[str]:
         predicates = set(self.has.keys())
+        if self.has_any:
+            for block in self.has_any:
+                predicates.update(block.keys())
         return predicates
 
     @property
     def referenced_predicates(self) -> set[str]:
-        predicates = set(self.has.keys())
+        predicates = set(self.constraint_predicates)
         if self._parsed_start["event_bound"]:
             predicates.add(self._parsed_start["event_bound"].replace("-", ""))
         if self._parsed_end["event_bound"]:
@@ -1091,7 +1287,9 @@ class TaskExtractorConfig:
         KeyError: "Trigger event predicate 'bar' not found in predicates: foo"
     """
 
-    predicates: dict[str, PlainPredicateConfig | DerivedPredicateConfig]
+    predicates: dict[
+        str, PlainPredicateConfig | DerivedPredicateConfig | DuringPredicateConfig | WithinPredicateConfig
+    ]
     trigger: EventConfig
     windows: dict[str, WindowConfig] | None
     label_window: str | None = None
@@ -1371,26 +1569,21 @@ class TaskExtractorConfig:
                     f"Something referenced predicate '{pred}' that wasn't defined in the configuration."
                 )
 
-            if "expr" in all_predicates[pred]:
-                stack = list(DerivedPredicateConfig(**all_predicates[pred]).input_predicates)
+            # Transitively pull in every predicate referenced (directly or indirectly) by this predicate.
+            # This covers derived (``expr``) as well as relational (``during`` / ``within``) predicates.
+            stack = list(_predicate_input_names(all_predicates[pred]))
 
-                while stack:
-                    nested_pred = stack.pop()
+            while stack:
+                nested_pred = stack.pop()
 
-                    if nested_pred not in all_predicates:
-                        raise KeyError(
-                            f"Predicate '{nested_pred}' referenced in '{pred}' is not defined in the "
-                            "configuration."
-                        )
+                if nested_pred not in all_predicates:
+                    raise KeyError(
+                        f"Predicate '{nested_pred}' referenced in '{pred}' is not defined in the "
+                        "configuration."
+                    )
 
-                    # if nested_pred is a DerivedPredicateConfig, unpack input_predicates and add to stack
-                    if "expr" in all_predicates[nested_pred]:
-                        derived_config = DerivedPredicateConfig(**all_predicates[nested_pred])
-                        stack.extend(derived_config.input_predicates)
-                        referenced_predicates.add(nested_pred)  # also add itself to referenced_predicates
-                    else:
-                        # if nested_pred is a PlainPredicateConfig, only add it to referenced_predicates
-                        referenced_predicates.add(nested_pred)
+                referenced_predicates.add(nested_pred)
+                stack.extend(_predicate_input_names(all_predicates[nested_pred]))
 
         logger.info("Parsing predicates...")
         predicates_to_parse = {k: v for k, v in final_predicates.items() if k in referenced_predicates}
@@ -1398,6 +1591,10 @@ class TaskExtractorConfig:
         for n, p in predicates_to_parse.items():
             if "expr" in p:
                 predicate_objs[n] = DerivedPredicateConfig(**p)
+            elif "during" in p:
+                predicate_objs[n] = DuringPredicateConfig(**p["during"])
+            elif "within" in p:
+                predicate_objs[n] = WithinPredicateConfig(**p["within"])
             else:
                 if isinstance(p, str):
                     raise ValueError(
@@ -1452,7 +1649,7 @@ class TaskExtractorConfig:
             match predicate:
                 case PlainPredicateConfig():
                     pass
-                case DerivedPredicateConfig():
+                case DerivedPredicateConfig() | DuringPredicateConfig() | WithinPredicateConfig():
                     for pred in predicate.input_predicates:
                         dag_relationships.append((pred, name))
                 case _:
@@ -1584,7 +1781,9 @@ class TaskExtractorConfig:
                 # start_node will have the constraints corresponding to this window, as it is defined relative
                 # to the end node.
                 end_node.constraints = {}
+                end_node.constraints_any = None
                 start_node.constraints = window.has
+                start_node.constraints_any = window.has_any
                 start_node.parent = end_node
             else:
                 # In this case, the start_node will bound an unconstrained window, as it is the window between
@@ -1592,7 +1791,9 @@ class TaskExtractorConfig:
                 # start_node will have the constraints corresponding to this window, as it is defined relative
                 # to the end node.
                 end_node.constraints = window.has
+                end_node.constraints_any = window.has_any
                 start_node.constraints = {}
+                start_node.constraints_any = None
                 end_node.parent = start_node
 
             window_nodes[f"{name}.start"] = start_node

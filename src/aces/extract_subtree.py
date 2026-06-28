@@ -8,7 +8,7 @@ import polars as pl
 from bigtree import Node
 
 from .aggregate import aggregate_event_bound_window, aggregate_temporal_window
-from .constraints import check_constraints
+from .constraints import check_any_constraints, check_constraints
 
 logger = logging.getLogger(__name__)
 
@@ -333,8 +333,13 @@ def extract_subtree(
             subtree_anchor_realizations, on=["subject_id", "subtree_anchor_timestamp"], how="inner"
         )
 
-        # Step 3: Filter to where constraints are valid
+        # Step 3: Filter to where constraints are valid. ``constraints`` is the conjunctive ``has`` (always
+        # present); ``constraints_any`` is the optional disjunctive ``has_any``. The two are mutually
+        # exclusive at the config level, so when ``has_any`` is set ``constraints`` is empty (passes all).
         window_summary_df = check_constraints(child.constraints, window_summary_df)
+        constraints_any = getattr(child, "constraints_any", None)
+        if constraints_any:
+            window_summary_df = check_any_constraints(constraints_any, window_summary_df)
 
         # Step 4: Produce child anchor realizations
         child_anchor_realizations = window_summary_df.select(

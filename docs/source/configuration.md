@@ -27,9 +27,11 @@ ______________________________________________________________________
 
 In the machine form used by ACES, the configuration file consists of three parts:
 
-- `predicates`, stored as a dictionary from string predicate names (which must be unique) to either
-  {py:class}`aces.config.PlainPredicateConfig` objects, which store raw predicates with no dependencies on other predicates, or
-  {py:class}`aces.config.DerivedPredicateConfig` objects, which store predicates that build on other predicates.
+- `predicates`, stored as a dictionary from string predicate names (which must be unique) to
+  {py:class}`aces.config.PlainPredicateConfig` objects, which store raw predicates with no dependencies on other predicates,
+  {py:class}`aces.config.DerivedPredicateConfig` objects, which store boolean combinations of other predicates, or
+  the relational {py:class}`aces.config.DuringPredicateConfig` / {py:class}`aces.config.WithinPredicateConfig`
+  objects, which define a predicate from a temporal relation to other events.
 - `trigger`, stored as a string to `EventConfig`
 - `windows`, stored as a dictionary from string window names (which must be unique) to {py:class}`aces.config.WindowConfig`
   objects.
@@ -114,6 +116,55 @@ accepted operations that can be applied to other predicates, containing precisel
 > [!NOTE]
 > Currently, `and`'s and `or`'s cannot be nested. Upon user request, we may support further advanced
 > analytic operations over predicates.
+
+#### Relational predicates: {py:class}`aces.config.DuringPredicateConfig` and {py:class}`aces.config.WithinPredicateConfig`
+
+The predicates above are *monadic* — each is a property of a single event. Relational predicates instead
+define a predicate from a **temporal relation to other events**, but the result is still materialized as an
+ordinary 0/1 predicate column per event, so it can be used anywhere a predicate is accepted (any window's
+`has`/`has_any`, `label`, the `trigger`, or inside a derived `expr`).
+
+There are two relational constructors, both expressing "a point inside an interval anchored to other
+event(s)", differing only in how the interval is sourced:
+
+- **`during`** — the interval is a **reconstructed open/close pair**. `during` accepts the fields `event`
+  (restricts which events this predicate can hold for), `opens` (interval-open boundary predicate), `closes`
+  (interval-close boundary predicate), and `closed` (inclusivity of the reconstructed `[opens, closes]`
+  interval: one of `both` (default), `left`, `right`, or `none`). `during(e)` is true iff `event(e)` holds
+  **and** `e`'s timestamp lies inside an open interval, reconstructed via the **net-open count**: an event is
+  "admitted" at time `τ` iff the number of `opens` at-or-before `τ` strictly exceeds the number of `closes`
+  before `τ` (the exact `≤`/`<` edges follow `closed`). This is exact for non-overlapping stays; for
+  nested/overlapping stays it is the "currently admitted" semantics (an unclosed `opens` keeps admitting).
+
+  ```yaml
+  predicates:
+    ami_enc:
+      during:
+        event: ami            # restrict THIS predicate's events
+        opens: ip_er_start    # interval-open boundary predicate
+        closes: ip_er_end     # interval-close boundary predicate
+        closed: both          # both | left | right | none  (default both)
+  ```
+
+- **`within`** — the interval is a **fixed offset window around another event**. `within` accepts the fields
+  `event`, `of` (the corroborating predicate), `before`, and `after` (timedelta strings, e.g. `365d`, each
+  defaulting to zero for a one-sided window). `within(e)` is true iff `event(e)` holds **and** there exists an
+  `of`-event whose timestamp lies in `[e.time - before, e.time + after]`. This is a pure proximity (range)
+  join, with no interval reconstruction and hence no overlap/pairing ambiguity.
+
+  ```yaml
+  predicates:
+    cs4_smk:
+      within:
+        event: cs4            # restrict THIS predicate's events
+        of: smoking           # the corroborating predicate
+        before: 365d          # look this far back from each `event` occurrence
+        after: 365d           # ... and this far forward (either may be 0 for one-sided)
+  ```
+
+Because the output is a plain predicate column, `has: {ami_enc: (1, None)}` ("∃ encounter-AMI in the
+window"), `has: {ami_enc: (None, 0)}` ("no prior encounter-AMI"), `label: ami_enc`, and `expr: and(ami,
+ami_enc)` all just work.
 
 ______________________________________________________________________
 
@@ -208,3 +259,27 @@ those endpoints are left unconstrained. Likewise, unreferenced predicates are al
 > the constraint for predicate `name` with constraint `name: (1, 2)` if the count of observations of predicate
 > `name` in a window was either 1 or 2. All constraints in the dictionary must be satisfied on a window for it
 > to be included.
+#### Disjunctive constraints: the `has_any` field
+
+The `has` field is a **conjunction** — every listed constraint must hold. To express a **disjunction** of
+constraint blocks, use `has_any`: a list of blocks where each block is itself an ordinary (conjunctive) `has`
+dictionary. The window is valid iff **at least one** block is fully satisfied.
+
+```yaml
+at_risk_entry:
+  start: null
+  end: trigger
+  start_inclusive: true
+  end_inclusive: true
+  has_any:                         # OR of blocks; each block is an AND of leaf constraints
+    - cs13: (1, None)              # CS1 ∪ CS3
+    - cs4: (2, None)               # >= 2 CS4
+    - cs4_smk: (1, None)           # CS4 corroborated by smoking
+```
+
+> [!NOTE]
+> `has` (conjunction) and `has_any` (disjunction) are mutually exclusive on the same window. `has_any` adds
+> exactly the one missing top-level OR connective; arbitrary nesting and negation of constraint trees remain
+> out of scope. When writing blocks in YAML flow style (`- {cs13: (1, None)}`), quote the value
+> (`- {cs13: "(1, None)"}`) so the comma is not parsed as a flow separator; block style (shown above) needs no
+> quoting.
