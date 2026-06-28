@@ -99,6 +99,12 @@ def _boolean_expr_bound_sum_lazy(
     if closed not in ("both", "none", "left", "right"):
         raise ValueError(f"Closed '{closed}' invalid!")
 
+    # Fast path: with no offset, a window is exactly "[anchor, nearest boundary]", which a
+    # join_asof + cumsum-difference computes directly on the (small) anchor set -- no
+    # full-frame concat+sort. Covers every event-bound window in the bundled sample configs.
+    if offset == timedelta(0):
+        return _event_bound_asof(lf, boundary_expr, mode, closed, anchors)
+
     aggd_over_offset = None
     if offset != timedelta(0):
         if offset > timedelta(0):
@@ -250,4 +256,101 @@ def _boolean_expr_bound_sum_lazy(
         st_timestamp_expr.alias("timestamp_at_start"),
         end_timestamp_expr.alias("timestamp_at_end"),
         *(agg_offset_fn(c).cast(PRED_CNT_TYPE, strict=False).fill_null(0).alias(c) for c in cols),
+    )
+
+
+# One microsecond: matches the epsilon the concat+sort path uses to place a boundary just
+# before/after a row in sort order, encoding the closed/strict tie behavior. datetime[us]
+# resolution means this is the smallest representable shift.
+_EPS = timedelta(seconds=1e-6)
+
+
+def _event_bound_asof(
+    lf: pl.LazyFrame,
+    boundary_expr: pl.Expr,
+    mode: str,
+    closed: str,
+    anchors: pl.LazyFrame | None,
+) -> pl.LazyFrame:
+    """Offset-free event-bound summary via cumulative sums + a single ``join_asof``.
+
+    Equivalent to the ``offset == 0`` case of :func:`_boolean_expr_bound_sum_lazy` but,
+    instead of a full-frame ``concat`` + ``sort`` + windowed ``fill_null``, it:
+
+    1. takes per-subject cumulative sums once (one pass over the full frame);
+    2. shifts each boundary event's key by ``±_EPS`` to encode the ``closed`` tie behavior
+       (exactly as the concat path does), giving a boundary table;
+    3. ``join_asof``-es each row/anchor to its nearest boundary (backward for
+       ``bound_to_row``, forward for ``row_to_bound``);
+    4. forms the count as a cumsum difference.
+
+    Because the join is on the (optionally anchor-restricted) row set rather than a
+    full-frame concat+sort, this is the cheap path for low-selectivity event-bound windows.
+    The ``±_EPS`` key shift mirrors the concat path's epsilon, so results are identical
+    (pinned by ``tests/test_window_exprs.py``).
+    """
+    cols = _predicate_cols(lf)
+    cs = [f"__cs_{c}" for c in cols]
+    csb = [f"__csb_{c}" for c in cols]
+
+    enriched = lf.with_columns(
+        [pl.col(c).cum_sum().over("subject_id").alias(cs[i]) for i, c in enumerate(cols)]
+    )
+
+    # Whether the boundary event's own value is excluded from the boundary-side cumsum.
+    drop_boundary_value = (mode == "bound_to_row" and closed in ("left", "both")) or (
+        mode == "row_to_bound" and closed not in ("right", "both")
+    )
+
+    if mode == "bound_to_row":
+        key_shift = -_EPS if closed in ("left", "both") else _EPS
+        strategy = "backward"
+    else:
+        key_shift = _EPS if closed in ("right", "both") else -_EPS
+        strategy = "forward"
+
+    boundary = (
+        enriched.filter(boundary_expr)
+        .select(
+            "subject_id",
+            (pl.col("timestamp") + key_shift).alias("__bkey"),
+            pl.col("timestamp").alias("timestamp_at_boundary"),
+            *[
+                (pl.col(cs[i]) - (pl.col(c) if drop_boundary_value else 0)).alias(csb[i])
+                for i, c in enumerate(cols)
+            ],
+        )
+        .sort("subject_id", "__bkey")
+    )
+
+    rows = enriched if anchors is None else enriched.join(anchors, on=["subject_id", "timestamp"], how="semi")
+    rows = rows.sort("subject_id", "timestamp")
+
+    joined = rows.join_asof(
+        boundary, left_on="timestamp", right_on="__bkey", by="subject_id", strategy=strategy
+    )
+
+    if mode == "bound_to_row":
+        subtract_row = closed in ("left", "none")
+        count_exprs = [
+            (pl.col(cs[i]) - pl.col(csb[i]) - (pl.col(c) if subtract_row else 0))
+            for i, c in enumerate(cols)
+        ]
+        st_expr = pl.col("timestamp_at_boundary")
+        end_expr = pl.when(pl.col("timestamp_at_boundary").is_not_null()).then(pl.col("timestamp"))
+    else:
+        add_row = closed in ("left", "both")
+        count_exprs = [
+            (pl.col(csb[i]) - pl.col(cs[i]) + (pl.col(c) if add_row else 0))
+            for i, c in enumerate(cols)
+        ]
+        st_expr = pl.when(pl.col("timestamp_at_boundary").is_not_null()).then(pl.col("timestamp"))
+        end_expr = pl.col("timestamp_at_boundary")
+
+    return joined.select(
+        "subject_id",
+        "timestamp",
+        st_expr.alias("timestamp_at_start"),
+        end_expr.alias("timestamp_at_end"),
+        *(e.cast(PRED_CNT_TYPE).fill_null(0).alias(c) for c, e in zip(cols, count_exprs)),
     )

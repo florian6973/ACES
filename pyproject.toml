@@ -80,6 +80,11 @@ addopts = [
   "--doctest-glob=*.md",
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
+filterwarnings = [
+  # The compiled engine sorts its frames before join_asof, but polars cannot verify
+  # sortedness when 'by' groups are provided, so this warning is a false positive.
+  "ignore:Sortedness of columns cannot be checked when 'by' groups provided:UserWarning",
+]
 
 [tool.coverage.report]
 exclude_also = ["logger\\.debug", "except ImportError:", "if TYPE_CHECKING:"]

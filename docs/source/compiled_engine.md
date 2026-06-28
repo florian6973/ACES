@@ -198,18 +198,32 @@ that step from O(all events) to O(anchors + boundary events). The cumulative sum
 taken over the full frame (one pass) so per-row counts stay correct. Wired through the
 optional `anchors=` argument; the window-twin tests still exercise the unrestricted path.
 
-Effect on event-bound configs (in-memory collect, 80 k subjects):
+### 6.3b Cumsum + `join_asof` for offset-free event-bound windows
 
-| config | legacy (s) | compiled before (s) | compiled after (s) |
-| --- | --- | --- | --- |
-| `imminent_mortality` | 2.26 | — | **0.54** (0.24×) |
-| `long_term_recurrence` | 1.62 | — | **0.92** (0.57×) |
-| `inhospital_mortality` | 1.88 | 3.99 (2.12×) | 3.11 (1.65×) |
+The anchor restriction still ran a full-frame `concat` + `sort` per window. For the common
+case of a window with **no offset** (every event-bound window in the bundled sample configs),
+[`_event_bound_asof`](../../src/aces/_window_exprs.py) replaces that entirely: it takes
+per-subject cumulative sums once, builds a boundary table whose keys are shifted by `±1 µs`
+(mirroring the concat path's epsilon, so the `closed`/tie behavior is identical), and locates
+each row/anchor's boundary with a single `join_asof` (backward for `bound_to_row`, forward for
+`row_to_bound`). The count is then a cumsum difference. No full-frame concat/sort; the join
+runs on the (anchor-restricted) row set. Offset windows keep the proven concat path. The
+216-case window-twin oracle pins this to bit-for-bit equality with the eager aggregator.
 
-Most event-bound configs now beat legacy. `inhospital_mortality` improves but remains slower:
-its event-bound windows anchor on admissions (~25 % of events — low selectivity), so the
-anchor restriction prunes little, and the `-_RECORD_START` window still cumsum-scans the full
-frame.
+Effect on event-bound configs (in-memory collect, 80 k subjects), cumulative across §6.3 +
+§6.3b:
+
+| config | legacy (s) | faithful (s) | + anchor restrict | + join_asof |
+| --- | --- | --- | --- | --- |
+| `imminent_mortality` | 2.45 | — | 0.54 | **0.56** (0.23×) |
+| `long_term_recurrence` | 1.52 | — | 0.92 | **0.81** (0.53×) |
+| `abnormal_lab` | 1.99 | — | — | **0.84** (0.42×) |
+| `inhospital_mortality` | 2.17 | 3.99 (2.12×) | 3.11 (1.65×) | **3.08 (1.42×)** |
+
+Most event-bound configs comfortably beat legacy. `inhospital_mortality` keeps improving
+(2.12× → 1.65× → 1.42×) but remains slower: its cost is no longer a single hot window but is
+spread across the whole plan (a static-variable filter, four windows, two nested event-bound
+edges, and the output structs), so no single optimization closes it.
 
 ### 6.4 Where the compiled engine now stands vs legacy
 
@@ -220,29 +234,32 @@ over `scan_parquet`; [`benchmarks/results/isolated.csv`](../../benchmarks/result
 
 | config (80 k subjects) | shape | legacy s / MB | compiled s / MB | time ratio |
 | --- | --- | --- | --- | --- |
-| `wide` ×16 | wide temporal | 8.59 / 6331 | **2.79 / 5842** | 0.32× |
-| `chain` ×16 | deep temporal | 6.65 / 3258 | **2.67** / 6048 | 0.40× |
-| `imminent_mortality` | event-bound | 2.39 / 4279 | **0.57 / 2677** | 0.24× |
-| `readmission_risk` | shallow | 1.16 / 1857 | **0.81 / 1568** | 0.70× |
-| `inhospital_mortality` | event-bound, low-selectivity | **2.06 / 2753** | 4.32 / 5503 | 2.10× |
+| `wide` ×16 | wide temporal | 8.13 / 6064 | **2.70 / 5867** | 0.33× |
+| `chain` ×16 | deep temporal | 6.51 / 3239 | **2.60** / 6159 | 0.40× |
+| `imminent_mortality` | event-bound | 2.50 / 4128 | **0.65 / 2757** | 0.26× |
+| `readmission_risk` | shallow | 1.20 / 1940 | **0.71 / 1488** | 0.59× |
+| `inhospital_mortality` | event-bound, low-selectivity | **2.08 / 2772** | 4.10 / 4180 | 1.97× |
 
 Memory does **not** uniformly track speed. Where the compiled engine wins it is often also
-leaner (`imminent_mortality` 2.7 GB vs 4.3 GB; `readmission_risk` 1.6 GB vs 1.9 GB), but the
-flat temporal accumulation keeps many summary structs live at once, so the deep/wide chains
-are faster yet heavier (`chain16` 6.0 GB vs 3.3 GB). `inhospital_mortality` is the one config
-that loses on both — its event-bound windows anchor on low-selectivity admissions and one of
-them scans the full history (`-_RECORD_START`).
+leaner (`imminent_mortality` 2.8 GB vs 4.1 GB; `readmission_risk` 1.5 GB vs 1.9 GB), but the
+flat temporal accumulation keeps many summary structs live at once, so the deep chain is
+faster yet heavier (`chain16` 6.2 GB vs 3.2 GB). `inhospital_mortality` is the one config that
+loses on both (though `join_asof` cut its peak from 5.5 GB to 4.2 GB) — its event-bound windows
+anchor on low-selectivity admissions and its cost is spread across the whole plan.
+
+> Note: the isolated sweep collects over `scan_parquet`, which makes `inhospital_mortality`
+> look slightly worse for the compiled engine (1.97×) than the in-memory `.lazy()` measurement
+> in §6.3b (1.42×); the other configs agree closely between the two.
 
 ## 7. Remaining optimization levers
 
-Flattening (§6.2) and the event-bound anchor restriction (§6.3) are done. Remaining:
+Flattening (§6.2), the event-bound anchor restriction (§6.3), and cumsum + `join_asof` for
+offset-free event-bound windows (§6.3b) are done. Remaining:
 
-- **Cumulative-sum + as-of join for event-bound windows.** Replace the per-window
-  `concat`+`sort` entirely: precompute per-subject prefix sums *once* (shared across windows),
-  locate each anchor's boundary with a `join_asof`, and take a cumsum-difference. This removes
-  the remaining full-frame scan and is the structure hand-written Polars uses; it is the main
-  lever for low-selectivity cases like `inhospital_mortality`. The hard part is matching the
-  exact `closed`/tie semantics — the 216-case window-twin oracle makes that tractable.
+- **Share the cumsum pass across windows.** `_event_bound_asof` still recomputes per-subject
+  prefix sums for each event-bound window; computing them once for the whole task would help
+  configs with several event-bound windows.
+- **Cumsum + as-of for *offset* event-bound windows**, retiring the last full-frame concat path.
 - **Per-window column projection.** Only compute the predicate counts a window actually
   references rather than all predicates for all windows (needs the "every window summarizes
   every predicate" output contract relaxed).
