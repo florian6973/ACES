@@ -86,12 +86,17 @@ def _window_summary_struct(name: str, predicate_cols: list[str]) -> pl.Expr:
     ).alias(f"{name}_summary")
 
 
+def _identity(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+
+
 def _process_children(
     node: Node,
     cur: pl.LazyFrame,
     predicates_lf: pl.LazyFrame,
     predicate_cols: list[str],
     offset: timedelta = timedelta(0),
+    barrier=_identity,
 ) -> pl.LazyFrame:
     """Compile every edge in ``node``'s subtree onto ``cur``, *flattening* where possible.
 
@@ -126,7 +131,11 @@ def _process_children(
             cur = cur.with_columns(_window_summary_struct(child.name, predicate_cols)).drop(
                 "timestamp_at_start", "timestamp_at_end", *predicate_cols
             )
-            cur = _process_children(child, cur, predicates_lf, predicate_cols, child_offset)
+            # No barrier on temporal edges: flattening already makes a temporal chain linear,
+            # and a per-window collect would just add overhead proportional to chain length.
+            # cur's accumulated rollings get materialized at the next event-bound edge (below)
+            # or at the final collect.
+            cur = _process_children(child, cur, predicates_lf, predicate_cols, child_offset, barrier)
 
         elif isinstance(endpoint_expr, ToEventWindowBounds):
             # Event-bound edge: anchor moves to a realized boundary event -> nest. Build the
@@ -148,11 +157,15 @@ def _process_children(
             )
             if child.constraints:
                 ws = ws.filter(_constraint_keep_expr(child.constraints))
+            # ws embeds the event-bound summary and is referenced several times below.
+            ws = barrier(ws)
 
             child_base = ws.select(
                 "subject_id", pl.col("child_anchor_timestamp").alias("subtree_anchor_timestamp")
             ).unique(maintain_order=True)
-            child_res = _process_children(child, child_base, predicates_lf, predicate_cols, timedelta(0))
+            child_res = _process_children(
+                child, child_base, predicates_lf, predicate_cols, timedelta(0), barrier
+            )
 
             # Lift the child subtree back into this anchor space and attach the edge's summary.
             child_res = (
@@ -173,7 +186,7 @@ def _process_children(
                     how="left",
                 )
             )
-            cur = cur.join(child_res, on=["subject_id", "subtree_anchor_timestamp"], how="inner")
+            cur = barrier(cur.join(child_res, on=["subject_id", "subtree_anchor_timestamp"], how="inner"))
 
         else:  # pragma: no cover - guarded by config parsing
             raise ValueError(f"Invalid endpoint expression: '{endpoint_expr}'")
@@ -181,7 +194,11 @@ def _process_children(
     return cur
 
 
-def compile_query(cfg: TaskExtractorConfig, materialize_base: bool = True) -> CompiledPlan:
+def compile_query(
+    cfg: TaskExtractorConfig,
+    materialize_base: bool = True,
+    materialize_windows: bool = True,
+) -> CompiledPlan:
     """Compile ``cfg`` into a function mapping a predicates ``LazyFrame`` to a result plan.
 
     The returned plan, when applied to a predicates ``LazyFrame`` and collected, produces a
@@ -192,7 +209,16 @@ def compile_query(cfg: TaskExtractorConfig, materialize_base: bool = True) -> Co
         materialize_base: Collect the prepared predicates frame once before fanning out to the
             windows, so the shared base prep is not re-evaluated per window (see the barrier
             note in ``plan``). Almost always a win; exposed mainly so benchmarks can compare.
+        materialize_windows: Collect the accumulated frame once at each **event-bound** edge
+            (the high-fan-out points, where ``ws`` and ``cur`` are each referenced several
+            times), so the embedded rollings / event-bound summaries are not re-evaluated per
+            reference. Temporal edges are left lazy (flattening already makes a temporal chain
+            linear, so a per-window collect there is pure overhead). Default on; exposed for
+            benchmark comparison.
     """
+    barrier = (
+        (lambda lf: lf.collect(engine="in-memory").lazy()) if materialize_windows else _identity
+    )
 
     def plan(predicates_lf: pl.LazyFrame) -> pl.LazyFrame:
         static_variables = [pred for pred in cfg.predicates if cfg.predicates[pred].static]
@@ -217,7 +243,9 @@ def compile_query(cfg: TaskExtractorConfig, materialize_base: bool = True) -> Co
             _constraint_keep_expr({cfg.trigger.predicate: (1, None)})
         ).select("subject_id", pl.col("timestamp").alias("subtree_anchor_timestamp"))
 
-        result = _process_children(cfg.window_tree, root_anchors, predicates_lf, predicate_cols)
+        result = _process_children(
+            cfg.window_tree, root_anchors, predicates_lf, predicate_cols, barrier=barrier
+        )
         result = result.rename({"subtree_anchor_timestamp": "trigger"})
 
         to_return_cols = [
