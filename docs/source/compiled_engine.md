@@ -8,10 +8,10 @@
 > **Performance** (see [§6](#6-findings-measured)): after five optimizations — flattening
 > temporal subtrees (§6.2), an event-bound anchor restriction (§6.3) and a cumsum + `join_asof`
 > fast path (§6.3b), a base-materialization barrier (§6.3c), and window materialization at
-> event-bound edges (§6.3d) — the compiled engine is **1.8–3.3× faster than legacy on every
-> benchmarked config**, scaling linearly in window count. The naive first compile was both
-> catastrophically super-linear on deep window chains and slower on event-bound configs; both
-> are fixed.
+> event-bound edges (§6.3d) — the compiled engine (default streaming) is **1.5–3.1× faster than
+> legacy on every benchmarked config**, scaling linearly in window count. The naive first compile
+> was both catastrophically super-linear on deep window chains and slower on event-bound configs;
+> both are fixed.
 
 ## Usage
 
@@ -302,21 +302,28 @@ This is the optimization that flips `inhospital_mortality` from the last remaini
 
 After all five optimizations (§6.2–6.3d), the compiled engine is **faster than legacy on every
 config tested**. Numbers below are the committed isolated-subprocess sweep (80 k subjects,
-in-memory collect over `scan_parquet`; [`benchmarks/results/isolated.csv`](../../benchmarks/results),
-`*_seconds.png` / `*_peak_wset_mb.png`):
+`scan_parquet`; [`benchmarks/results/isolated.csv`](../../benchmarks/results)), reporting the
+**default streaming engine** (`engine=compiled`, `collect(engine="streaming")`):
 
-| config (80 k subjects) | shape | legacy s / MB | compiled s / MB | time / mem |
+| config (80 k subjects) | shape | legacy s / MB | compiled (streaming) s / MB | time / mem |
 | --- | --- | --- | --- | --- |
-| `wide` ×16 | wide temporal | 8.54 / 6519 | **2.82 / 6066** | 0.33× / 0.93× |
-| `chain` ×16 | deep temporal | 7.33 / 3176 | **2.61** / 5707 | 0.36× / 1.80× |
-| `imminent_mortality` | event-bound | 2.39 / 4501 | **0.76 / 2639** | 0.32× / 0.59× |
-| `readmission_risk` | shallow | 1.20 / 1804 | **0.66 / 1304** | 0.55× / 0.72× |
-| `inhospital_mortality` | event-bound, low-selectivity | 2.14 / 2753 | **1.11 / 1549** | 0.52× / 0.56× |
+| `wide` ×16 | wide temporal | 8.54 / 6519 | **4.75 / 6347** | 0.56× / 0.97× |
+| `chain` ×16 | deep temporal | 7.33 / 3176 | **4.74** / 6433 | 0.65× / 2.03× |
+| `imminent_mortality` | event-bound | 2.39 / 4501 | **0.77 / 1950** | 0.32× / 0.43× |
+| `readmission_risk` | shallow | 1.20 / 1804 | **0.72 / 1311** | 0.60× / 0.73× |
+| `inhospital_mortality` | event-bound, low-selectivity | 2.14 / 2753 | **1.09 / 1470** | 0.51× / 0.53× |
 
-The compiled engine is **1.8–3.3× faster** across the board and **leaner on four of five**
-(`inhospital_mortality`, the original problem child, is now 0.52× time *and* 0.56× memory — its
-streaming variant peaks at 1.47 GB vs legacy's 2.75 GB). The one place compiled is heavier is the
-deep temporal chain (`chain16` 5.7 GB vs 3.2 GB) — investigated in §6.5.
+The compiled engine is **1.5–3.1× faster** across the board and **leaner on four of five**
+(`inhospital_mortality`, the original problem child, is now 0.51× time *and* 0.53× memory). The
+one place compiled is heavier is the deep temporal chain (`chain16` 6.4 GB vs 3.2 GB) —
+investigated in §6.5.
+
+> **Streaming vs in-memory.** These are the streaming numbers (the default). The in-memory
+> collect (`streaming=False` / `compiled_mem` in the CSV) is essentially tied on the real
+> configs but **markedly faster on the synthetic temporal chains** — `chain16` 4.74 s → 2.61 s
+> and `wide16` 4.75 s → 2.82 s (0.36× / 0.33× legacy) — because streaming's morsel pipeline adds
+> overhead on those many-rolling plans without a spill benefit at ≤10 M rows. If you run a
+> chain-heavy config that fits in RAM, prefer `lazy_query(..., streaming=False)`.
 
 ### 6.5 Why deep temporal chains use more memory (negative result)
 
@@ -335,9 +342,10 @@ streaming engine does not release them either. So the per-window-free behavior l
 free is not reachable through materialization barriers here; it would need a different plan
 shape (see §7).
 
-This is a deliberate **time-for-memory trade on deep temporal chains** (≈2.5× faster, ≈1.8×
-heavier) — and it is specific to that synthetic stress shape: every *real* sample config has few
-windows and the compiled engine is both faster and leaner on all of them.
+This is a deliberate **time-for-memory trade on deep temporal chains** (default streaming ≈1.5×
+faster / ≈2× heavier; in-memory ≈2.8× faster / ≈1.8× heavier) — and it is specific to that
+synthetic stress shape: every *real* sample config has few windows and the compiled engine is
+both faster and leaner on all of them.
 
 ## 7. Remaining optimization levers
 
