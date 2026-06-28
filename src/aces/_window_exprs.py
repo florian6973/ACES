@@ -61,11 +61,24 @@ def summarize_temporal_window(lf: pl.LazyFrame, endpoint_expr: TemporalWindowBou
     )
 
 
-def summarize_event_bound_window(lf: pl.LazyFrame, endpoint_expr: ToEventWindowBounds) -> pl.LazyFrame:
-    """Lazy analogue of :func:`aces.aggregate.aggregate_event_bound_window`."""
+def summarize_event_bound_window(
+    lf: pl.LazyFrame,
+    endpoint_expr: ToEventWindowBounds,
+    anchors: pl.LazyFrame | None = None,
+) -> pl.LazyFrame:
+    """Lazy analogue of :func:`aces.aggregate.aggregate_event_bound_window`.
+
+    If ``anchors`` (a frame with ``subject_id``/``timestamp``) is given, the output is
+    restricted to those rows. This is *not* just a post-filter: it shrinks the expensive
+    concat+sort inside the boundary-sum from O(all events) to O(anchors + boundary events),
+    which is exact because non-anchor "real" rows never affect an anchor's nearest boundary
+    (only boundary rows propagate via the fill). See ``_boolean_expr_bound_sum_lazy``.
+    """
     if not isinstance(endpoint_expr, ToEventWindowBounds):
         endpoint_expr = ToEventWindowBounds(*endpoint_expr)
-    return _boolean_expr_bound_sum_lazy(lf, **endpoint_expr.boolean_expr_bound_sum_kwargs)
+    return _boolean_expr_bound_sum_lazy(
+        lf, **endpoint_expr.boolean_expr_bound_sum_kwargs, anchors=anchors
+    )
 
 
 def _boolean_expr_bound_sum_lazy(
@@ -74,6 +87,7 @@ def _boolean_expr_bound_sum_lazy(
     mode: str,
     closed: str,
     offset: timedelta = timedelta(0),
+    anchors: pl.LazyFrame | None = None,
 ) -> pl.LazyFrame:
     """Faithful lazy port of :func:`aces.aggregate.boolean_expr_bound_sum`.
 
@@ -166,8 +180,16 @@ def _boolean_expr_bound_sum_lazy(
         pl.lit(False).alias("is_real"),
     )
 
+    # Only the anchor rows need to appear in the output, and dropping non-anchor real rows
+    # does not change any anchor's nearest boundary (only boundary rows carry the fill), so
+    # this restriction is exact -- it just shrinks the concat+sort below. The cumsum columns
+    # were already computed over the full frame above, so per-row counts stay correct.
+    real_rows = lf
+    if anchors is not None:
+        real_rows = lf.join(anchors, on=["subject_id", "timestamp"], how="semi")
+
     with_at_boundary_events = (
-        pl.concat([lf.with_columns(pl.lit(True).alias("is_real")), at_boundary_df], how="diagonal")
+        pl.concat([real_rows.with_columns(pl.lit(True).alias("is_real")), at_boundary_df], how="diagonal")
         .sort(by=["subject_id", "timestamp"])
         .select(
             "subject_id",

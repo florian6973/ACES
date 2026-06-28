@@ -36,14 +36,24 @@ def _peak_wset_mb() -> float:
         return float("nan")
 
 
+def _load_cfg(kind: str, config: str, n_windows: int) -> TaskExtractorConfig:
+    if kind == "sample":
+        return TaskExtractorConfig.load(f"sample_configs/{config}.yaml")
+    from complex_configs import BUILDERS
+
+    return BUILDERS[kind](n_windows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--kind", default="sample", choices=["sample", "chain", "wide"])
+    parser.add_argument("--config", default="", help="sample config stem (kind=sample)")
+    parser.add_argument("--n-windows", type=int, default=1, help="window count (kind=chain|wide)")
     parser.add_argument("--parquet", required=True)
     parser.add_argument("--engine", required=True, choices=["legacy", "compiled", "compiled_mem"])
     args = parser.parse_args()
 
-    cfg = TaskExtractorConfig.load(f"sample_configs/{args.config}.yaml")
+    cfg = _load_cfg(args.kind, args.config, args.n_windows)
 
     t0 = time.perf_counter()
     if args.engine == "legacy":

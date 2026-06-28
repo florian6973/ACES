@@ -187,39 +187,65 @@ to a realized boundary event. This restores linear scaling (right column above):
 it is **20× faster than the naive compile and ≈2× faster than legacy**, with bit-for-bit
 identical output (parity tests green).
 
-### 6.3 Where the compiled engine now stands vs legacy
+### 6.3 The event-bound anchor restriction
 
-| config (80 k subjects, 4.08 M rows) | shape | legacy (s) | compiled (s) | ratio |
+A second optimization targets the event-bound path. `summarize_event_bound_window` ran the
+full `boolean_expr_bound_sum` (a `concat` + `sort` + windowed `fill_null`) over *every* row,
+then `_process_children` discarded all non-anchor rows. But an anchor's nearest boundary is
+determined only by the boundary rows — non-anchor "real" rows never affect it. So restricting
+the real rows to the current anchor set *before* the concat/sort is **exact**, and shrinks
+that step from O(all events) to O(anchors + boundary events). The cumulative sums are still
+taken over the full frame (one pass) so per-row counts stay correct. Wired through the
+optional `anchors=` argument; the window-twin tests still exercise the unrestricted path.
+
+Effect on event-bound configs (in-memory collect, 80 k subjects):
+
+| config | legacy (s) | compiled before (s) | compiled after (s) |
+| --- | --- | --- | --- |
+| `imminent_mortality` | 2.26 | — | **0.54** (0.24×) |
+| `long_term_recurrence` | 1.62 | — | **0.92** (0.57×) |
+| `inhospital_mortality` | 1.88 | 3.99 (2.12×) | 3.11 (1.65×) |
+
+Most event-bound configs now beat legacy. `inhospital_mortality` improves but remains slower:
+its event-bound windows anchor on admissions (~25 % of events — low selectivity), so the
+anchor restriction prunes little, and the `-_RECORD_START` window still cumsum-scans the full
+frame.
+
+### 6.4 Where the compiled engine now stands vs legacy
+
+After flattening (§6.2) + the anchor restriction (§6.3), config shape decides the winner.
+Numbers below are the committed isolated-subprocess sweep (80 k subjects, in-memory collect
+over `scan_parquet`; [`benchmarks/results/isolated.csv`](../../benchmarks/results),
+`*_seconds.png` / `*_peak_wset_mb.png`):
+
+| config (80 k subjects) | shape | legacy s / MB | compiled s / MB | time ratio |
 | --- | --- | --- | --- | --- |
-| temporal chain ×32 | deep temporal | 2.71 | **1.34** | 0.49× |
-| `readmission_risk` | shallow | 1.19 | **1.01** | 0.85× |
-| `inhospital_mortality` | event-bound-heavy | **1.91** | 3.99 | 2.09× |
+| `wide` ×16 | wide temporal | 8.59 / 6331 | **2.79 / 5842** | 0.32× |
+| `chain` ×16 | deep temporal | 6.65 / 3258 | **2.67** / 6048 | 0.40× |
+| `imminent_mortality` | event-bound | 2.39 / 4279 | **0.57 / 2677** | 0.24× |
+| `readmission_risk` | shallow | 1.16 / 1857 | **0.81 / 1568** | 0.70× |
+| `inhospital_mortality` | event-bound, low-selectivity | **2.06 / 2753** | 4.32 / 5503 | 2.10× |
 
-So after flattening the compiled engine **wins on temporal-heavy and wide configs** and
-**loses on event-bound-heavy configs**. The remaining gap is entirely in the event-bound
-window summary: those edges still nest *and* run the faithful, full-frame
-`boolean_expr_bound_sum` port (a `concat` + `sort` + windowed `fill_null` over the whole
-frame per event-bound window). Memory tracks time — the compiled engine is leaner where it
-is faster and heavier where it is slower; the earlier isolated peak-RSS sweep
-([`benchmarks/results/isolated.csv`](../../benchmarks/results)) was taken on the
-event-bound-heavy `inhospital_mortality`/`readmission_risk` pair *before* flattening and
-should be re-run for the current numbers.
+Memory does **not** uniformly track speed. Where the compiled engine wins it is often also
+leaner (`imminent_mortality` 2.7 GB vs 4.3 GB; `readmission_risk` 1.6 GB vs 1.9 GB), but the
+flat temporal accumulation keeps many summary structs live at once, so the deep/wide chains
+are faster yet heavier (`chain16` 6.0 GB vs 3.3 GB). `inhospital_mortality` is the one config
+that loses on both — its event-bound windows anchor on low-selectivity admissions and one of
+them scans the full history (`-_RECORD_START`).
 
 ## 7. Remaining optimization levers
 
-Flattening (§6.2) is done. The next wins are all about the **event-bound** path and avoiding
-full-frame work:
+Flattening (§6.2) and the event-bound anchor restriction (§6.3) are done. Remaining:
 
-- **Cumulative-sum + as-of join for window summaries.** Precompute per-subject prefix sums of
-  each predicate *once*, then express every temporal/event-bound window count as a
-  cumsum-difference located by as-of joins on the (small) anchor set — sharing the single
-  heavy pass across all windows instead of one full-frame rolling / `boolean_expr_bound_sum`
-  per window. This is the structure hand-written Polars uses and is the most promising lever
-  for the event-bound configs.
+- **Cumulative-sum + as-of join for event-bound windows.** Replace the per-window
+  `concat`+`sort` entirely: precompute per-subject prefix sums *once* (shared across windows),
+  locate each anchor's boundary with a `join_asof`, and take a cumsum-difference. This removes
+  the remaining full-frame scan and is the structure hand-written Polars uses; it is the main
+  lever for low-selectivity cases like `inhospital_mortality`. The hard part is matching the
+  exact `closed`/tie semantics — the 216-case window-twin oracle makes that tractable.
 - **Per-window column projection.** Only compute the predicate counts a window actually
   references rather than all predicates for all windows (needs the "every window summarizes
-  every predicate" output contract relaxed, or the full summary computed lazily only for
-  surviving rows).
+  every predicate" output contract relaxed).
 - **Early subject pruning.** Drop subjects that cannot satisfy a constraint before descending.
 - **Out-of-core, by-subject streaming**, measured against real MIMIC-scale data rather than
   synthetic ≤10 M-row frames — the only regime where the streaming engine should help.

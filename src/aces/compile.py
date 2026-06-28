@@ -134,18 +134,17 @@ def _process_children(
             child_anchor_time = (
                 "timestamp_at_start" if endpoint_expr.end_event.startswith("-") else "timestamp_at_end"
             )
+            # Restrict the (expensive) event-bound summary to the current anchor timestamps.
+            anchor_ts = cur.select(
+                "subject_id", pl.col("subtree_anchor_timestamp").alias("timestamp")
+            ).unique(maintain_order=True)
             ws = (
-                summarize_event_bound_window(predicates_lf, endpoint_expr)
+                summarize_event_bound_window(predicates_lf, endpoint_expr, anchors=anchor_ts)
                 .with_columns(
                     pl.col("timestamp").alias("subtree_anchor_timestamp"),
                     pl.col(child_anchor_time).alias("child_anchor_timestamp"),
                 )
                 .drop("timestamp")
-                .join(
-                    cur.select("subject_id", "subtree_anchor_timestamp").unique(maintain_order=True),
-                    on=["subject_id", "subtree_anchor_timestamp"],
-                    how="inner",
-                )
             )
             if child.constraints:
                 ws = ws.filter(_constraint_keep_expr(child.constraints))
