@@ -13,6 +13,48 @@
 > catastrophically super-linear on deep window chains and slower on event-bound configs; both
 > are fixed.
 
+## Usage
+
+The compiled engine is **opt-in**; the legacy engine remains the default.
+
+**CLI** — pass `engine=compiled` (a Hydra override) to `aces-cli`:
+
+```bash
+aces-cli engine=compiled cohort_dir="..." cohort_name="..." data.standard="..." data.path="..."
+```
+
+`engine` accepts `legacy` (default) or `compiled`; anything else errors. It is wired in
+[`run.py`](../../src/aces/run.py) and declared in
+[`configs/_aces.yaml`](../../src/aces/configs/_aces.yaml).
+
+**Python API** — use `lazy_query`, a drop-in for `query` with the same signature and output:
+
+```python
+from aces.config import TaskExtractorConfig
+from aces.lazy_query import lazy_query
+
+cfg = TaskExtractorConfig.load("sample_configs/inhospital_mortality.yaml")
+result = lazy_query(cfg, predicates_df)   # == query(cfg, predicates_df), but compiled
+```
+
+### Two collect modes (`streaming` vs `in-memory`)
+
+`lazy_query` builds one `LazyFrame` and collects it. Polars offers two execution engines for
+the collect, which the benchmarks report as two rows:
+
+- **`compiled` (streaming)** — `lazy_query(..., streaming=True)` → `collect(engine="streaming")`.
+  The default. Processes in morsels, usually the lowest peak memory.
+- **`compiled_mem` (in-memory)** — `lazy_query(..., streaming=False)` → `collect(engine="in-memory")`.
+  Materializes intermediates; often slightly faster on data that fits in RAM.
+
+Both produce identical results (they are the same plan, only the collect engine differs). If a
+streaming collect hits an unsupported operation, `lazy_query` automatically falls back to the
+in-memory engine. Pick streaming when memory-bound, in-memory when speed-bound and data fits.
+
+> The benchmark scripts under [`benchmarks/`](../../benchmarks) optionally use `psutil` (peak
+> memory) and `matplotlib` (`--plot`); install them ad hoc, e.g.
+> `uv run --with psutil --with matplotlib python benchmarks/run_isolated.py ...`.
+
 ## 1. Motivation
 
 ACES is already Polars-based, but `query()` runs a **recursive Python interpreter**

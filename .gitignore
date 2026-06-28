@@ -164,8 +164,9 @@ cython_debug/
 passwords.txt
 outputs/
 results/
-# Committed benchmark artifacts for the compiled engine (override the broad results/ rule)
+# Keep the compiled-engine benchmark CSV (override the broad results/ rule); plots (*.png)
+# are regenerable with `run_isolated.py --plot` and stay ignored.
 !benchmarks/results/
-!benchmarks/results/**
+!benchmarks/results/*.csv
 sample_configs/.logs/
 .logs/

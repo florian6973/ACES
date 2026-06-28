@@ -64,8 +64,6 @@ dev = [
     "pytest-cov >= 7, < 8",
     "pytest-subtests >= 0.15, < 1",
     "hypothesis >= 6.150, < 7",
-    "psutil >= 5.9",       # peak-memory measurement in benchmarks/
-    "matplotlib >= 3.7",   # benchmark plots
 ]
 
 [project.urls]
