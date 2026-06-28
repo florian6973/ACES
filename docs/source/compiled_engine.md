@@ -274,17 +274,39 @@ in-memory collect over `scan_parquet`; [`benchmarks/results/isolated.csv`](../..
 The compiled engine is **1.8–3.3× faster** across the board and **leaner on four of five**
 (`inhospital_mortality`, the original problem child, is now 0.52× time *and* 0.56× memory — its
 streaming variant peaks at 1.47 GB vs legacy's 2.75 GB). The one place compiled is heavier is the
-deep temporal chain (`chain16` 5.7 GB vs 3.2 GB), where the flat accumulation keeps every
-window's summary struct live at once — the remaining memory lever in §7.
+deep temporal chain (`chain16` 5.7 GB vs 3.2 GB) — investigated in §6.5.
+
+### 6.5 Why deep temporal chains use more memory (negative result)
+
+Measuring peak-RSS *delta* against window count isolates the cause. Legacy stays **flat**
+(~10–30 MB delta independent of `W`) because it materializes each window node and frees it
+before the next; the compiled engine's delta **grows with `W`** (≈0.2 GB → 0.4 GB → 1.6 GB →
+3.2 GB for `W` = 1, 2, 8, 16), because the one fused plan keeps every window's full-frame
+rolling intermediate live at once.
+
+The intuitive fix — a periodic `cur.collect().lazy()` barrier to free intermediates like legacy
+does — **does not work, and makes it worse**: collecting a frame that still lazily embeds the
+prior rollings forces them all to compute at that point, and the `collect`→`lazy` round-trip's
+transient copies push peak RSS *up* (a barrier every window took `chain16` from 5.9 GB to
+13.5 GB). Barriering the rolling frame instead of `cur`, or both, was also worse. The Polars
+streaming engine does not release them either. So the per-window-free behavior legacy gets for
+free is not reachable through materialization barriers here; it would need a different plan
+shape (see §7).
+
+This is a deliberate **time-for-memory trade on deep temporal chains** (≈2.5× faster, ≈1.8×
+heavier) — and it is specific to that synthetic stress shape: every *real* sample config has few
+windows and the compiled engine is both faster and leaner on all of them.
 
 ## 7. Remaining optimization levers
 
 All five optimizations in §6.2–6.3d are done and the compiled engine now beats legacy on every
 benchmarked config. Remaining levers, in rough priority:
 
-- **Reduce peak memory on temporal chains.** The flat accumulation holds every window's summary
-  struct live at once; building the output structs lazily / late would cut the `chain16`
-  memory overhead (the one place compiled is still heavier than legacy).
+- **Reduce peak memory on temporal chains** (the one place compiled is heavier — see the §6.5
+  negative result). Materialization barriers don't help; the likely real fix is to avoid keeping
+  every window's full-frame rolling live at once — e.g. compute each temporal window's counts
+  for only the anchor rows (a cumsum + `join_asof`, like the event-bound path) so no 4M-row
+  rolling intermediate is held, or split a long chain into independently-collected segments.
 - **Share the cumsum pass across windows.** `_event_bound_asof` still recomputes per-subject
   prefix sums for each event-bound window; computing them once per task would help configs with
   several event-bound windows.
