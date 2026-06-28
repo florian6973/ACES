@@ -5,12 +5,12 @@
 > `LazyFrame` plan, as an alternative to the recursive interpreter in
 > [`extract_subtree.py`](../../src/aces/extract_subtree.py).
 >
-> **Performance is config-shape-dependent** (see [§6](#6-findings-measured)). After the
-> flattening optimization in [§6.2](#62-the-flattening-optimization), the compiled engine is
-> **faster than legacy on temporal-heavy and wide configs** (≈0.3–0.85× of legacy time and
-> linear in window count), but is **still slower on event-bound-heavy configs** because the
-> event-bound window aggregation has no flattening yet. The naive (pre-flattening) compile
-> was catastrophically super-linear on deep window chains; that is fixed.
+> **Performance** (see [§6](#6-findings-measured)): after four optimizations — flattening
+> temporal subtrees (§6.2), an event-bound anchor restriction (§6.3) and a cumsum + `join_asof`
+> fast path (§6.3b), and a base-materialization barrier (§6.3c) — the compiled engine is
+> **1.6–3.8× faster than legacy on four of five benchmarked configs and within ~1.3× (and
+> leaner) on the fifth**, scaling linearly in window count. The naive first compile was
+> catastrophically super-linear on deep window chains; that is fixed.
 
 ## 1. Motivation
 
@@ -221,44 +221,57 @@ Effect on event-bound configs (in-memory collect, 80 k subjects), cumulative acr
 | `inhospital_mortality` | 2.17 | 3.99 (2.12×) | 3.11 (1.65×) | **3.08 (1.42×)** |
 
 Most event-bound configs comfortably beat legacy. `inhospital_mortality` keeps improving
-(2.12× → 1.65× → 1.42×) but remains slower: its cost is no longer a single hot window but is
-spread across the whole plan (a static-variable filter, four windows, two nested event-bound
-edges, and the output structs), so no single optimization closes it.
+(2.12× → 1.65× → 1.42×) but at this point is bottlenecked by repeated base prep, addressed next.
+
+### 6.3c Materialization barrier on the shared base
+
+Profiling `inhospital_mortality` showed the **static-variable filter**
+(`(timestamp.is_null() & male>0).any().over(subject)`, a full-frame window op) being
+recomputed **~6 times** — once per window/branch — because every `summarize_*` reads from the
+same prepared `predicates_lf` and Polars' common-subplan elimination does not dedupe it across
+the join tree. `compile_query(materialize_base=True)` (the default) collects the prepared base
+**once** before fanning out, mirroring the per-node materialization the legacy interpreter gets
+for free. This is value-preserving (parity tests unchanged) and drops `inhospital_mortality`
+from 1.42× to **1.04×** legacy in-memory; the only minor cost is one extra full-frame collect,
+a slight regression on configs with no static variables and few windows (e.g.
+`imminent_mortality` 0.54 s → 0.61 s, still 0.26× legacy).
 
 ### 6.4 Where the compiled engine now stands vs legacy
 
-After flattening (§6.2) + the anchor restriction (§6.3), config shape decides the winner.
-Numbers below are the committed isolated-subprocess sweep (80 k subjects, in-memory collect
-over `scan_parquet`; [`benchmarks/results/isolated.csv`](../../benchmarks/results),
+After flattening (§6.2), the event-bound anchor restriction + `join_asof` (§6.3–6.3b), and the
+base materialization barrier (§6.3c), the compiled engine **wins or ties on every config
+tested**. Numbers below are the committed isolated-subprocess sweep (80 k subjects, in-memory
+collect over `scan_parquet`; [`benchmarks/results/isolated.csv`](../../benchmarks/results),
 `*_seconds.png` / `*_peak_wset_mb.png`):
 
-| config (80 k subjects) | shape | legacy s / MB | compiled s / MB | time ratio |
+| config (80 k subjects) | shape | legacy s / MB | compiled s / MB | time / mem |
 | --- | --- | --- | --- | --- |
-| `wide` ×16 | wide temporal | 8.13 / 6064 | **2.70 / 5867** | 0.33× |
-| `chain` ×16 | deep temporal | 6.51 / 3239 | **2.60** / 6159 | 0.40× |
-| `imminent_mortality` | event-bound | 2.50 / 4128 | **0.65 / 2757** | 0.26× |
-| `readmission_risk` | shallow | 1.20 / 1940 | **0.71 / 1488** | 0.59× |
-| `inhospital_mortality` | event-bound, low-selectivity | **2.08 / 2772** | 4.10 / 4180 | 1.97× |
+| `wide` ×16 | wide temporal | 8.34 / 6242 | **2.64** / 6040 | 0.32× / 0.97× |
+| `chain` ×16 | deep temporal | 6.60 / 3241 | **2.64** / 5769 | 0.40× / 1.78× |
+| `imminent_mortality` | event-bound | 2.44 / 4387 | **0.63 / 2513** | 0.26× / 0.57× |
+| `readmission_risk` | shallow | 1.17 / 1773 | **0.65 / 1326** | 0.56× / 0.75× |
+| `inhospital_mortality` | event-bound, low-selectivity | 2.03 / 2803 | 2.57 / **2304** | 1.27× / 0.82× |
 
-Memory does **not** uniformly track speed. Where the compiled engine wins it is often also
-leaner (`imminent_mortality` 2.8 GB vs 4.1 GB; `readmission_risk` 1.5 GB vs 1.9 GB), but the
-flat temporal accumulation keeps many summary structs live at once, so the deep chain is
-faster yet heavier (`chain16` 6.2 GB vs 3.2 GB). `inhospital_mortality` is the one config that
-loses on both (though `join_asof` cut its peak from 5.5 GB to 4.2 GB) — its event-bound windows
-anchor on low-selectivity admissions and its cost is spread across the whole plan.
-
-> Note: the isolated sweep collects over `scan_parquet`, which makes `inhospital_mortality`
-> look slightly worse for the compiled engine (1.97×) than the in-memory `.lazy()` measurement
-> in §6.3b (1.42×); the other configs agree closely between the two.
+The compiled engine is **1.6–3.8× faster** on four of five and, after the barrier, faster *and
+leaner* on most. `inhospital_mortality` is now the only one slower on time — 1.27× isolated
+(1.04× in-memory `.lazy()`; the `scan_parquet` path costs the compiled engine a little more) —
+but it is **leaner than legacy** (2.3 GB vs 2.8 GB; the streaming variant is 1.7 GB). The lone
+remaining time loss is small and comes with a memory win. The one place compiled is clearly
+heavier is the deep temporal chain (`chain16` 5.8 GB vs 3.2 GB), where the flat accumulation
+keeps many summary structs live at once.
 
 ## 7. Remaining optimization levers
 
-Flattening (§6.2), the event-bound anchor restriction (§6.3), and cumsum + `join_asof` for
-offset-free event-bound windows (§6.3b) are done. Remaining:
+Flattening (§6.2), the event-bound anchor restriction + `join_asof` (§6.3–6.3b), and the base
+materialization barrier (§6.3c) are done. Remaining:
 
 - **Share the cumsum pass across windows.** `_event_bound_asof` still recomputes per-subject
   prefix sums for each event-bound window; computing them once for the whole task would help
-  configs with several event-bound windows.
+  configs with several event-bound windows (and is the most likely lever to flip
+  `inhospital_mortality` to a win).
+- **Reduce peak memory on temporal chains.** The flat accumulation holds every window's summary
+  struct live at once; building the output structs lazily / late would cut the `chain16`
+  memory overhead.
 - **Cumsum + as-of for *offset* event-bound windows**, retiring the last full-frame concat path.
 - **Per-window column projection.** Only compute the predicate counts a window actually
   references rather than all predicates for all windows (needs the "every window summarizes

@@ -181,11 +181,17 @@ def _process_children(
     return cur
 
 
-def compile_query(cfg: TaskExtractorConfig) -> CompiledPlan:
+def compile_query(cfg: TaskExtractorConfig, materialize_base: bool = True) -> CompiledPlan:
     """Compile ``cfg`` into a function mapping a predicates ``LazyFrame`` to a result plan.
 
     The returned plan, when applied to a predicates ``LazyFrame`` and collected, produces a
     frame equal to ``aces.query.query(cfg, predicates_df)`` (after a canonical sort).
+
+    Args:
+        cfg: The parsed task configuration.
+        materialize_base: Collect the prepared predicates frame once before fanning out to the
+            windows, so the shared base prep is not re-evaluated per window (see the barrier
+            note in ``plan``). Almost always a win; exposed mainly so benchmarks can compare.
     """
 
     def plan(predicates_lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -194,6 +200,14 @@ def compile_query(cfg: TaskExtractorConfig) -> CompiledPlan:
             predicates_lf = _check_static_variables_lazy(static_variables, predicates_lf)
         else:
             predicates_lf = predicates_lf.drop_nulls(subset=["subject_id", "timestamp"])
+
+        # Materialization barrier: every window summary and the trigger filter read from this
+        # same prepared frame, but Polars' common-subplan elimination does not dedupe it across
+        # the join tree, so without this it re-runs the (expensive) static-variable filter and
+        # base scan once per window. Collecting once mirrors the per-node materialization the
+        # legacy interpreter gets for free. (No-op cost when the input is already a small frame.)
+        if materialize_base:
+            predicates_lf = predicates_lf.collect(engine="in-memory").lazy()
 
         predicate_cols = [
             c for c in predicates_lf.collect_schema().names() if c not in {"subject_id", "timestamp"}
