@@ -164,5 +164,8 @@ cython_debug/
 passwords.txt
 outputs/
 results/
+# Committed benchmark artifacts for the compiled engine (override the broad results/ rule)
+!benchmarks/results/
+!benchmarks/results/**
 sample_configs/.logs/
 .logs/

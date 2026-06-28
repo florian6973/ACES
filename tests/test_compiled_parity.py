@@ -49,7 +49,6 @@ def assert_engines_match(cfg: TaskExtractorConfig, predicates_df: pl.DataFrame) 
     assert_frame_equal(_canonical(legacy), _canonical(compiled), check_dtypes=True)
 
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="compiled engine WIP", strict=False)
 @pytest.mark.parametrize("config_path", SAMPLE_CONFIGS, ids=lambda p: p.stem)
 def test_sample_config_parity(config_path: Path) -> None:
     cfg = TaskExtractorConfig.load(str(config_path))
@@ -57,7 +56,6 @@ def test_sample_config_parity(config_path: Path) -> None:
     assert_engines_match(cfg, predicates_df)
 
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="compiled engine WIP", strict=False)
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_inhospital_mortality_multiseed(seed: int) -> None:
     cfg = TaskExtractorConfig.load(str(REPO_ROOT / "sample_configs" / "inhospital_mortality.yaml"))

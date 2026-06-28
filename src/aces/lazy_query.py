@@ -49,10 +49,10 @@ def lazy_query(
     plan = compile_query(cfg)
     result_lf = plan(predicates_df.lazy())
 
+    if not streaming:
+        return result_lf.collect(engine="in-memory")
     try:
-        return result_lf.collect(streaming=streaming)
+        return result_lf.collect(engine="streaming")
     except pl.exceptions.PolarsError:  # pragma: no cover - streaming fallback
-        if streaming:
-            logger.warning("Streaming collect failed; falling back to in-memory collect.")
-            return result_lf.collect(streaming=False)
-        raise
+        logger.warning("Streaming collect failed; falling back to in-memory collect.")
+        return result_lf.collect(engine="in-memory")

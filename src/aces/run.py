@@ -15,6 +15,7 @@ from meds import LabelSchema
 from omegaconf import DictConfig, OmegaConf
 
 from . import config, predicates, query
+from .lazy_query import lazy_query
 
 logger = logging.getLogger(__name__)
 config_yaml = files("aces").joinpath("configs/_aces.yaml")
@@ -137,7 +138,14 @@ def main(cfg: DictConfig) -> None:  # pragma: no cover
     predicates_df = predicates.get_predicates_df(task_cfg, cfg.data)
 
     # query results
-    result = query.query(task_cfg, predicates_df)
+    engine = str(getattr(cfg, "engine", "legacy")).lower()
+    if engine == "compiled":
+        logger.info("Using the compiled Polars engine.")
+        result = lazy_query(task_cfg, predicates_df)
+    elif engine == "legacy":
+        result = query.query(task_cfg, predicates_df)
+    else:
+        raise ValueError(f"Unknown engine '{engine}'. Expected 'legacy' or 'compiled'.")
     result_is_empty = len(result) == 0
 
     # save results to parquet

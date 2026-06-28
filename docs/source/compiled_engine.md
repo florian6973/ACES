@@ -1,9 +1,13 @@
-# Compiled Polars Engine (design)
+# Compiled Polars Engine
 
-> Status: **design / in progress**. This document specifies a new, opt-in execution
-> backend for ACES that *compiles* a task configuration into a single fused Polars
-> `LazyFrame` query plan, as an alternative to the recursive interpreter in
-> [`extract_subtree.py`](../../src/aces/extract_subtree.py).
+> Status: **implemented and opt-in, but NOT recommended for performance.** This document
+> specifies a new execution backend for ACES that *compiles* a task configuration into a
+> single fused Polars `LazyFrame` plan, as an alternative to the recursive interpreter in
+> [`extract_subtree.py`](../../src/aces/extract_subtree.py). It is fully correct (bit-for-bit
+> parity with the legacy engine, enforced by tests), but benchmarking showed it is **slower
+> and uses more memory** than the legacy engine at every size tested. See
+> [§6 Findings](#6-findings-measured). It ships behind `engine=compiled` for reproducibility
+> and as a foundation for the future, genuinely-optimized directions in [§7](#7-where-a-real-speedup-would-come-from).
 
 ## 1. Motivation
 
@@ -33,8 +37,14 @@ child anchor:
   row, i.e. one boundary timestamp per anchor.
 
 So the recursion **never fans out combinatorially**. That means it can be **unrolled at
-compile time into one fused `LazyFrame`** and handed to the Polars streaming engine,
-which is what unlocks the time and (especially) memory improvements.
+compile time into one fused `LazyFrame`** and handed to the Polars streaming engine.
+
+The *hypothesis* was that fusing the plan and streaming it would cut both time and peak
+memory. The implementation below is a faithful, correct realization of that idea — and the
+benchmark in [§6](#6-findings-measured) shows the hypothesis **does not hold**: a faithful
+compile does the same work as the interpreter, and fusing the whole tree into one plan
+*removes* the per-node materialize-and-free checkpoints that keep the interpreter's peak
+memory low. The negative result is documented here because it is itself the useful finding.
 
 ## 2. Goals & non-goals
 
@@ -112,16 +122,6 @@ Finally, assemble `_summary` structs per node, `trigger`, `label`, and
 `index_timestamp` exactly as [`query.py:153-197`](../../src/aces/query.py#L153),
 and select the same output column order.
 
-### Why this is faster / leaner
-
-- **One optimized graph**: predicate pushdown, projection pushdown, and common
-  sub-expression handling run across the whole task, not per node.
-- **Streaming execution**: bounded memory instead of materializing a full
-  per-row aggregation of the entire frame at every recursion step (the source of the
-  106 GB peaks).
-- **No Python round-trips**: the per-node `DataFrame` → join → filter loop collapses
-  into native Polars.
-
 ### Highest-risk component
 
 The lazy reimplementation of `boolean_expr_bound_sum` — the
@@ -133,51 +133,86 @@ dedicated parity tests (§5) and is the first thing to land and verify.
 
 Parity is enforced by a **differential oracle**: the legacy engine *is* the spec.
 
-- `tests/test_compiled_parity.py`: for every `sample_configs/*.yaml` and every existing
-  fixture (`test_e2e`, `test_meds`, `test_other_meds`, `test_override_meds`), run both
-  `query(cfg, df)` and `lazy_query(cfg, df).collect()` and `assert_frame_equal` after a
-  canonical sort of rows and columns.
-- Targeted per-feature parity tests where the compile is subtle: each `closed` mode,
-  `row_to_bound`/`bound_to_row`, positive/negative/zero offsets, negative windows,
-  `_RECORD_START`/`_RECORD_END`, static predicates, empty results, multi-branch trees,
-  and `label`/`index_timestamp` selection.
-- Extend [`test_aggregate_hypothesis.py`](../../tests/test_aggregate_hypothesis.py):
-  feed Hypothesis-generated frames through both the legacy and lazy window builders and
-  assert equality (fuzzes the `boolean_expr_bound_sum` reimplementation).
-- Reuse
-  [`test_extract_subtree_idempotency.py`](../../tests/test_extract_subtree_idempotency.py)
-  scenarios against the compiled path.
+- [`tests/test_window_exprs.py`](../../tests/test_window_exprs.py): pins the lazy window
+  builders directly to `aggregate_temporal_window` / `aggregate_event_bound_window` across
+  the full `mode × closed × offset × end_event` matrix on fixed and randomized frames
+  (216 cases). This is where the highest-risk `boolean_expr_bound_sum` port is verified.
+- [`tests/test_compiled_parity.py`](../../tests/test_compiled_parity.py): for every
+  `sample_configs/*.yaml` and multiple seeds, runs both `query(cfg, df)` and
+  `lazy_query(cfg, df)` and `assert_frame_equal` after a canonical sort.
 
-A streaming-unsupported op triggers an automatic fallback to in-memory `.collect()`;
-both paths are asserted equal in tests.
+A streaming-unsupported op triggers an automatic fallback to in-memory `.collect()` in
+[`lazy_query`](../../src/aces/lazy_query.py).
 
-## 6. Benchmark plan (synthetic)
+## 6. Findings (measured)
 
-- `benchmarks/generate.py`: deterministic, seeded parametric generator producing a
-  MEDS-style predicates parquet. Parameters: `n_subjects`, events-per-subject
-  distribution, number of predicates, predicate sparsity. (No wall-clock/random-seed
-  hazards — seed is an explicit arg.)
-- `benchmarks/bench.py`: sweep `n_subjects` (e.g. 1k → 1M), run both engines on each
-  `sample_configs/` task, record:
-  - wall time via `time.perf_counter`,
-  - peak memory via `psutil` peak working set + `tracemalloc` for Python allocations,
-  - assert output equality at small sizes (the benchmark double-checks parity).
-- Outputs: `benchmarks/results/*.csv` plus matplotlib plots (time-vs-N and
-  peak-mem-vs-N, legacy vs compiled), committed for reference alongside
-  [`profiling.md`](profiling.md).
+Synthetic sweep (seed 0, 50 events/subject) on this machine (Windows, Polars 1.40), each
+engine run in an **isolated subprocess** so peak working set is attributable to that engine
+alone. Raw data: [`benchmarks/results/isolated.csv`](../../benchmarks/results) and the
+`*_seconds.png` / `*_peak_wset_mb.png` plots beside it.
 
-## 7. Phased delivery
+`inhospital_mortality` (event-bound-heavy: `-_RECORD_START`, `-> discharge_or_death`):
 
-1. **Scaffolding + harness**: branch, module stubs, synthetic generator, differential
-   test harness wired over `sample_configs/` (initially `xfail`).
-2. **Temporal-only compiler**: temporal windows, constraints, static vars, label/index,
-   multi-branch. Differential tests green for temporal-only configs.
-3. **Event-bound compiler**: lazy `boolean_expr_bound_sum`; full parity across all
-   `sample_configs/` and fixtures.
-4. **Engine flag**: `engine=compiled` in `run.py`/Hydra + `lazy_query` public API.
-5. **Benchmark**: run the sweep, commit results + plots, write up findings here.
+| subjects | pred rows | engine | time (s) | peak mem (MB) |
+| --- | --- | --- | --- | --- |
+| 80,000 | 4.08 M | legacy | **2.06** | **2,788** |
+| 80,000 | 4.08 M | compiled (streaming) | 3.71 | 4,115 |
+| 80,000 | 4.08 M | compiled (in-memory) | 2.75 | 3,352 |
+| 200,000 | 10.2 M | legacy | **8.15** | **6,615** |
+| 200,000 | 10.2 M | compiled (streaming) | 12.23 | 9,706 |
+| 200,000 | 10.2 M | compiled (in-memory) | 8.66 | 8,590 |
 
-## 8. Open edge cases tracked during implementation
+`readmission_risk` (lighter, larger output):
+
+| subjects | pred rows | engine | time (s) | peak mem (MB) |
+| --- | --- | --- | --- | --- |
+| 200,000 | 10.2 M | legacy | **3.11** | **4,123** |
+| 200,000 | 10.2 M | compiled (streaming) | 9.47 | 4,406 |
+| 200,000 | 10.2 M | compiled (in-memory) | 8.12 | 5,580 |
+
+**The legacy engine wins on both time and memory at every size tested.** The compiled
+streaming engine is consistently the slowest and the most memory-hungry. Why:
+
+1. **No work is saved.** The compiled plan is a faithful translation of the recursion, so
+   it performs the same aggregations and joins — there is no algorithmic reduction for the
+   query optimizer to exploit, and the per-window summary contract forces every predicate
+   column through every window (so projection pushdown can't prune them).
+2. **Fusing removes free memory checkpoints.** The interpreter materializes one node's
+   `DataFrame`, uses it, and lets Python free it before the next node. Collapsing the whole
+   tree into one plan keeps far more intermediate state live simultaneously, *raising* peak
+   memory rather than lowering it.
+3. **Streaming overhead without streaming benefit.** Nothing spills at ≤10 M rows, so the
+   streaming engine's morsel/pipeline machinery is pure overhead on this self-join- and
+   struct-heavy plan.
+
+The 106 GB peaks in [`profiling.md`](profiling.md) therefore are **not** explained by
+"materializing at every node" — that materialization is actually load-bearing for keeping
+memory bounded.
+
+## 7. Where a real speedup would come from
+
+A faithful compile cannot beat the interpreter; it does the same work with less freedom to
+release memory. A genuinely faster engine would need *algorithmic* changes, not just lazy
+translation:
+
+- **Per-window column projection.** Only compute the predicate counts a window's
+  constraints/label actually reference, instead of all predicates for all windows (requires
+  changing the "every window summarizes every predicate" output contract, or computing the
+  full summary lazily only for surviving rows).
+- **Avoid full-frame re-aggregation per node.** Both engines aggregate over the entire frame
+  at each node; restricting aggregation to the neighborhoods of surviving anchors before
+  summarizing would cut work super-linearly on selective tasks.
+- **Early subject pruning.** Drop subjects that cannot satisfy a constraint before
+  descending, shrinking every downstream aggregation.
+- **Chunked/streamed-by-subject execution** for the genuine out-of-core regime (the only
+  place streaming should help), measured against real MIMIC-scale data rather than synthetic
+  ≤10 M-row frames.
+
+These are out of scope for the faithful-parity engine landed here, which exists to (a)
+establish the differential oracle and benchmark harness and (b) make the negative result
+reproducible.
+
+## 8. Edge cases handled (parity-verified)
 
 - `(subject_id, timestamp)` uniqueness assumption (already enforced by `query()`).
 - Row-order of output: differential comparison sorts first; document that the compiled

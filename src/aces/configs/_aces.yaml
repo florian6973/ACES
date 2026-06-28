@@ -10,6 +10,12 @@ cohort_name: ""
 config_path: ${cohort_dir}/${cohort_name}.yaml
 predicates_path: null
 
+# Execution engine: 'legacy' (the recursive interpreter, default) or 'compiled' (an
+# opt-in engine that compiles the task into a single fused Polars LazyFrame plan and runs
+# it with the streaming engine). Both produce identical results; see
+# https://eventstreamaces.readthedocs.io/en/latest/compiled_engine.html
+engine: legacy
+
 # Path to store the output file. The `${data._prefix}` addition allows us to add shard specific prefixes in a
 # sharded data mode.
 output_filepath: ${cohort_dir}/${cohort_name}${data._prefix}.parquet
