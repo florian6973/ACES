@@ -565,32 +565,50 @@ def add_value_predicate_column(
         else:
             win = f"{int(cfg.lookback.total_seconds())}s"
             ts, by = "timestamp", "subject_id"
-            # rolling_*_by needs a non-null, sorted index; static rows are handled by leaving them null
-            match fn:
-                case "count":
-                    expr = cnt.rolling_sum_by(ts, win, closed="right").over(by)
-                case "sum":
-                    expr = (val * cnt).rolling_sum_by(ts, win, closed="right").over(by)
-                case "mean":
-                    expr = (val * cnt).rolling_sum_by(ts, win, closed="right").over(by) / cnt.rolling_sum_by(
-                        ts, win, closed="right"
-                    ).over(by)
-                case "min":
-                    expr = val.rolling_min_by(ts, win, closed="right").over(by)
-                case "max":
-                    expr = val.rolling_max_by(ts, win, closed="right").over(by)
-                case "last":
-                    # last observation carried forward, invalidated once it is older than the lookback
-                    seen_at = pl.when(val.is_not_null()).then(pl.col(ts)).otherwise(None)
-                    last_t = seen_at.forward_fill().over(by)
-                    expr = (
-                        pl.when((pl.col(ts) - last_t) <= cfg.lookback)
-                        .then(val.forward_fill().over(by))
-                        .otherwise(None)
-                    )
-            data = data.with_columns(
-                pl.when(pl.col(ts).is_null()).then(None).otherwise(expr).cast(pl.Float64).alias(out)
-            )
+            if fn == "last":
+                # last observation carried forward, invalidated once older than the lookback.
+                # Expressed with forward_fill rather than a rolling aggregate because "the most
+                # recent non-null value" is not a rolling reduction.
+                seen_at = pl.when(val.is_not_null()).then(pl.col(ts)).otherwise(None)
+                last_t = seen_at.forward_fill().over(by)
+                expr = (
+                    pl.when((pl.col(ts) - last_t) <= cfg.lookback)
+                    .then(val.forward_fill().over(by))
+                    .otherwise(None)
+                )
+                data = data.with_columns(
+                    pl.when(pl.col(ts).is_null()).then(None).otherwise(expr).cast(pl.Float64).alias(out)
+                )
+            else:
+                # DataFrame.rolling() rather than the rolling_*_by expression inside over(): the
+                # latter panics with "chunked array is not contiguous" on the frame this pipeline
+                # builds up column by column.
+                total, weight = "__rolling_total", "__rolling_weight"
+                # `count` needs only the event count, and for a count-only source no value column
+                # is materialised at all -- so the value expressions must not be referenced here.
+                cols = [cnt.fill_null(0).alias(weight)]
+                if fn != "count":
+                    cols += [(val.fill_null(0) * cnt.fill_null(0)).alias(total), val.alias("__rolling_val")]
+                timed = data.filter(pl.col(ts).is_not_null()).with_columns(*cols)
+                match fn:
+                    case "count":
+                        agg = pl.col(weight).sum().alias(out)
+                    case "sum":
+                        agg = pl.col(total).sum().alias(out)
+                    case "mean":
+                        agg = (pl.col(total).sum() / pl.col(weight).sum()).alias(out)
+                    case "min":
+                        agg = pl.col("__rolling_val").min().alias(out)
+                    case "max":
+                        agg = pl.col("__rolling_val").max().alias(out)
+                rolled = (
+                    timed.rolling(index_column=ts, period=win, closed="right", group_by=by)
+                    .agg(agg)
+                    .select([by, ts, out])
+                )
+                data = data.join(rolled, on=[by, ts], how="left").with_columns(
+                    pl.col(out).cast(pl.Float64)
+                )
 
     if cfg.emits_predicate_column:
         data = data.with_columns(
