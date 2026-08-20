@@ -7,7 +7,7 @@ import polars as pl
 from omegaconf import DictConfig
 from polars.exceptions import ColumnNotFoundError
 
-from .config import PlainPredicateConfig, TaskExtractorConfig
+from .config import VALUE_COL_PREFIX, ValuePredicateConfig, PlainPredicateConfig, TaskExtractorConfig
 from .types import (
     ANY_EVENT_COLUMN,
     END_OF_RECORD_KEY,
@@ -227,7 +227,9 @@ def direct_load_plain_predicates(
 
 
 def generate_plain_predicates_from_meds(
-    data_path: Path, predicates: dict[str, PlainPredicateConfig]
+    data_path: Path,
+    predicates: dict[str, PlainPredicateConfig],
+    value_sources: frozenset[str] = frozenset(),
 ) -> pl.DataFrame:
     """Generate plain predicate columns from a MEDS dataset.
 
@@ -236,6 +238,9 @@ def generate_plain_predicates_from_meds(
     Args:
         data_path: The path to the MEDS dataset file.
         predicates: The dictionary of plain predicate configurations.
+        value_sources: Names of plain predicates whose numeric values are needed by a value
+            predicate. For these, a `__val__<name>` column carrying the per-timestamp mean of the
+            matching events' `numeric_value` is emitted alongside the usual count column.
 
     Returns:
         The Polars DataFrame containing the extracted predicates per subject per timestamp across the entire
@@ -273,18 +278,32 @@ def generate_plain_predicates_from_meds(
 
     # generate plain predicate columns
     logger.info("Generating plain predicate columns...")
+    value_cols = []
     for name, plain_predicate in predicates.items():
         data = data.with_columns(data["code"].cast(pl.String).alias("code"))  # may remove after MEDS v0.3
-        data = data.with_columns(plain_predicate.MEDS_eval_expr().cast(PRED_CNT_TYPE).alias(name))
+        matches = plain_predicate.MEDS_eval_expr()
+        data = data.with_columns(matches.cast(PRED_CNT_TYPE).alias(name))
+        if name in value_sources:
+            # keep the matching events' numeric values so value predicates can aggregate them; the
+            # per-timestamp value is their MEAN, which with the event count reconstructs both a true
+            # total (mean x count) and a true mean downstream
+            vcol = f"{VALUE_COL_PREFIX}{name}"
+            data = data.with_columns(
+                pl.when(matches).then(pl.col("numeric_value")).otherwise(None).cast(pl.Float64).alias(vcol)
+            )
+            value_cols.append(vcol)
         logger.info(f"Added predicate column '{name}'.")
 
     # clean up predicates_df
     logger.info("Cleaning up predicates dataframe...")
     predicate_cols = list(predicates.keys())
     return (
-        data.select(["subject_id", "timestamp", *predicate_cols])
+        data.select(["subject_id", "timestamp", *predicate_cols, *value_cols])
         .group_by(["subject_id", "timestamp"], maintain_order=True)
-        .agg(*(pl.col(c).sum().cast(PRED_CNT_TYPE).alias(c) for c in predicate_cols))
+        .agg(
+            *(pl.col(c).sum().cast(PRED_CNT_TYPE).alias(c) for c in predicate_cols),
+            *(pl.col(c).mean().alias(c) for c in value_cols),
+        )
     )
 
 
@@ -472,6 +491,112 @@ def generate_plain_predicates_from_esgpt(data_path: Path, predicates: dict) -> p
             value_columns[name] = config.measurement_configs[measurement_name].values_column
 
     return process_esgpt_data(subjects_df, events_df, dynamic_measurements_df, value_columns, predicates)
+
+
+def _value_col(name: str) -> str:
+    """The float column holding a predicate's per-timestamp numeric value."""
+    return f"{VALUE_COL_PREFIX}{name}"
+
+
+def add_value_predicate_column(
+    data: pl.DataFrame, name: str, cfg: ValuePredicateConfig, value_names: set[str]
+) -> pl.DataFrame:
+    """Add the value column (and, if thresholded, the 0/1 predicate column) for one value predicate.
+
+    Values are carried per (subject_id, timestamp). For a PLAIN source predicate the per-timestamp
+    value is the MEAN of the matching events' ``numeric_value`` at that timestamp, and its event
+    COUNT is the plain predicate's own column -- so ``fn: sum`` reconstructs a true total
+    (mean x count) while ``fn: mean`` reconstructs a true mean. For a VALUE source the value is
+    that predicate's own value and its count is 1 wherever the value is non-null.
+
+    Rows with a null timestamp (static rows) get a null value: every aggregation here is temporal.
+
+    Args:
+        data: the predicates dataframe built so far.
+        name: the value predicate's name.
+        cfg: its configuration.
+        value_names: names of predicates that are themselves value predicates, needed to tell
+            a source that carries a value column apart from one that carries only an event count.
+
+    Returns:
+        `data` with `__val__<name>` added, plus `<name>` when the predicate is thresholded.
+    """
+    out = _value_col(name)
+
+    if cfg.value_expr is not None:
+        def operand(side: str) -> pl.Expr:
+            v = cfg.value_expr[side]
+            return pl.lit(float(v)) if not isinstance(v, str) else pl.col(_value_col(v))
+
+        left, right, op = operand("left"), operand("right"), cfg.value_expr["op"]
+        match op:
+            case "+":
+                expr = left + right
+            case "-":
+                expr = left - right
+            case "*":
+                expr = left * right
+            case "/":
+                # a zero or missing denominator yields null -> the predicate is false, not an error
+                expr = pl.when(right == 0).then(None).otherwise(left / right)
+        data = data.with_columns(expr.cast(pl.Float64).alias(out))
+    else:
+        src, fn = cfg.value_agg["of"], cfg.value_agg["fn"]
+        src_is_value = src in value_names
+        # Per-timestamp value and event weight of the source. A plain or derived source carries an
+        # event COUNT in its own column; a value source carries a VALUE, which weighs 1 wherever it
+        # is present.
+        val = pl.col(_value_col(src))
+        cnt = (
+            val.is_not_null().cast(pl.Float64)
+            if src_is_value
+            else pl.col(src).cast(pl.Float64)
+        )
+
+        if cfg.lookback is None:
+            match fn:
+                case "count":
+                    expr = cnt
+                case "sum":
+                    expr = val * cnt
+                case _:
+                    expr = val
+            data = data.with_columns(expr.cast(pl.Float64).alias(out))
+        else:
+            win = f"{int(cfg.lookback.total_seconds())}s"
+            ts, by = "timestamp", "subject_id"
+            # rolling_*_by needs a non-null, sorted index; static rows are handled by leaving them null
+            match fn:
+                case "count":
+                    expr = cnt.rolling_sum_by(ts, win, closed="right").over(by)
+                case "sum":
+                    expr = (val * cnt).rolling_sum_by(ts, win, closed="right").over(by)
+                case "mean":
+                    expr = (val * cnt).rolling_sum_by(ts, win, closed="right").over(by) / cnt.rolling_sum_by(
+                        ts, win, closed="right"
+                    ).over(by)
+                case "min":
+                    expr = val.rolling_min_by(ts, win, closed="right").over(by)
+                case "max":
+                    expr = val.rolling_max_by(ts, win, closed="right").over(by)
+                case "last":
+                    # last observation carried forward, invalidated once it is older than the lookback
+                    seen_at = pl.when(val.is_not_null()).then(pl.col(ts)).otherwise(None)
+                    last_t = seen_at.forward_fill().over(by)
+                    expr = (
+                        pl.when((pl.col(ts) - last_t) <= cfg.lookback)
+                        .then(val.forward_fill().over(by))
+                        .otherwise(None)
+                    )
+            data = data.with_columns(
+                pl.when(pl.col(ts).is_null()).then(None).otherwise(expr).cast(pl.Float64).alias(out)
+            )
+
+    if cfg.emits_predicate_column:
+        data = data.with_columns(
+            cfg.threshold_expr(out).fill_null(False).cast(PRED_CNT_TYPE).alias(name)
+        )
+    return data
 
 
 def get_predicates_df(cfg: TaskExtractorConfig, data_config: DictConfig) -> pl.DataFrame:
@@ -708,7 +833,9 @@ def get_predicates_df(cfg: TaskExtractorConfig, data_config: DictConfig) -> pl.D
             ts_format = data_config.ts_format
             data = direct_load_plain_predicates(data_path, list(plain_predicates.keys()), ts_format)
         case "meds":
-            data = generate_plain_predicates_from_meds(data_path, plain_predicates)
+            data = generate_plain_predicates_from_meds(
+                data_path, plain_predicates, value_sources=cfg.value_predicate_sources
+            )
         case "esgpt":
             data = generate_plain_predicates_from_esgpt(data_path, plain_predicates)
         case _:
@@ -720,7 +847,14 @@ def get_predicates_df(cfg: TaskExtractorConfig, data_config: DictConfig) -> pl.D
     # derived predicates
     logger.info("Loaded plain predicates. Generating derived predicate columns...")
     static_variables = [pred for pred in cfg.plain_predicates if cfg.plain_predicates[pred].static]
+    value_names = set(cfg.value_predicates)
     for name, code in cfg.derived_predicates.items():
+        if isinstance(code, ValuePredicateConfig):
+            data = add_value_predicate_column(data, name, code, value_names)
+            logger.info(f"Added value predicate column '{name}'.")
+            if code.emits_predicate_column:
+                predicate_cols.append(name)
+            continue
         if any(x in static_variables for x in code.input_predicates):
             data = data.with_columns(
                 [

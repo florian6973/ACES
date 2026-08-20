@@ -315,6 +315,165 @@ class DerivedPredicateConfig:
         return False
 
 
+VALUE_COL_PREFIX = "__val__"
+VALUE_AGG_FNS = ("count", "sum", "mean", "min", "max", "last")
+VALUE_OPS = {"+", "-", "*", "/"}
+
+
+@dataclasses.dataclass
+class ValuePredicateConfig:
+    """A predicate whose truth depends on a NUMERIC quantity derived from other predicates.
+
+    Plain predicates ask "did an event happen"; derived `and(...)`/`or(...)` predicates combine those
+    row-wise, which means at a single timestamp. Neither can express a quantity computed *across*
+    events -- a lookback aggregate, a ratio between two measurements, a change relative to a
+    patient's own baseline. This config adds exactly that, in two composable operations.
+
+    A ValuePredicateConfig produces a float VALUE column. If `value_min` / `value_max` are given it
+    additionally produces the ordinary 0/1 predicate column of the same name, so a thresholded value
+    predicate can be used anywhere a plain predicate can -- as a window constraint, a trigger, or a
+    label.
+
+    Args:
+        value_agg: Aggregate another predicate over a lookback window, as
+            ``{of: <predicate>, fn: <fn>, lookback: <duration>}``. `fn` is one of
+            ``count, sum, mean, min, max, last``. `lookback` is optional; omitted, the
+            aggregate covers only the current timestamp. `count` aggregates the source's event
+            COUNT; every other `fn` aggregates its numeric VALUE.
+        value_expr: Arithmetic between two operands, as ``{left: <operand>, op: <op>, right: <operand>}``
+            where each operand is a predicate name or a numeric constant, and `op` is one of
+            ``+ - * /``. Division by zero yields null rather than an error, so a missing denominator
+            makes the predicate false rather than crashing the extraction.
+        value_min, value_max, value_min_inclusive, value_max_inclusive: Threshold the value into a
+            0/1 predicate column, with the same meaning as on PlainPredicateConfig.
+
+    Raises:
+        ValueError: If neither or both of `value_agg`/`value_expr` are given, or if any field is
+            malformed.
+
+    Examples:
+        >>> cfg = ValuePredicateConfig(value_agg={"of": "creatinine", "fn": "min", "lookback": "7d"})
+        >>> cfg.input_predicates
+        ['creatinine']
+        >>> cfg.lookback
+        datetime.timedelta(days=7)
+        >>> cfg.emits_predicate_column
+        False
+        >>> cfg = ValuePredicateConfig(
+        ...     value_expr={"left": "creatinine_now", "op": "/", "right": "creatinine_baseline"},
+        ...     value_min=1.5, value_min_inclusive=True,
+        ... )
+        >>> cfg.input_predicates
+        ['creatinine_now', 'creatinine_baseline']
+        >>> cfg.emits_predicate_column
+        True
+        >>> ValuePredicateConfig(value_expr={"left": "pao2", "op": "/", "right": 100})
+        ... # a numeric constant is a valid operand
+        ValuePredicateConfig(value_agg=None,
+                             value_expr={'left': 'pao2', 'op': '/', 'right': 100},
+                             value_min=None, value_max=None,
+                             value_min_inclusive=None, value_max_inclusive=None, static=False)
+        >>> ValuePredicateConfig()
+        Traceback (most recent call last):
+            ...
+        ValueError: A value predicate needs exactly one of 'value_agg' or 'value_expr'. Got neither.
+        >>> ValuePredicateConfig(value_agg={"of": "x", "fn": "median"})
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid 'fn' in value_agg: 'median'. Expected one of: count, sum, mean, min, max,
+        last.
+        >>> ValuePredicateConfig(value_expr={"left": "a", "op": "^", "right": "b"})
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid 'op' in value_expr: '^'. Expected one of: *, +, -, /.
+    """
+
+    value_agg: dict[str, Any] | None = None
+    value_expr: dict[str, Any] | None = None
+    value_min: float | None = None
+    value_max: float | None = None
+    value_min_inclusive: bool | None = None
+    value_max_inclusive: bool | None = None
+    static: bool = False
+
+    def __post_init__(self) -> None:
+        if bool(self.value_agg) == bool(self.value_expr):
+            got = "both" if self.value_agg else "neither"
+            raise ValueError(
+                f"A value predicate needs exactly one of 'value_agg' or 'value_expr'. Got {got}."
+            )
+
+        self.lookback: timedelta | None = None
+        if self.value_agg:
+            unknown = set(self.value_agg) - {"of", "fn", "lookback"}
+            if unknown:
+                raise ValueError(f"Unknown keys in value_agg: {sorted(unknown)}. Expected: of, fn, lookback.")
+            if not self.value_agg.get("of"):
+                raise ValueError("value_agg requires an 'of' field naming the source predicate.")
+            fn = self.value_agg.get("fn")
+            if fn not in VALUE_AGG_FNS:
+                raise ValueError(
+                    f"Invalid 'fn' in value_agg: {fn!r}. Expected one of: {', '.join(VALUE_AGG_FNS)}."
+                )
+            if self.value_agg.get("lookback") is not None:
+                self.lookback = parse_timedelta(str(self.value_agg["lookback"]))
+                if self.lookback < timedelta(0):
+                    raise ValueError(f"value_agg lookback must not be negative. Got: {self.lookback}.")
+            self.input_predicates = [self.value_agg["of"]]
+        else:
+            unknown = set(self.value_expr) - {"left", "op", "right"}
+            if unknown:
+                raise ValueError(f"Unknown keys in value_expr: {sorted(unknown)}. Expected: left, op, right.")
+            op = self.value_expr.get("op")
+            if op not in VALUE_OPS:
+                raise ValueError(
+                    f"Invalid 'op' in value_expr: {op!r}. Expected one of: {', '.join(sorted(VALUE_OPS))}."
+                )
+            for side in ("left", "right"):
+                if side not in self.value_expr:
+                    raise ValueError(f"value_expr requires a {side!r} operand.")
+            self.input_predicates = [
+                self.value_expr[s] for s in ("left", "right") if isinstance(self.value_expr[s], str)
+            ]
+
+    @property
+    def emits_predicate_column(self) -> bool:
+        """Whether this predicate is thresholded, and so usable as an ordinary 0/1 predicate."""
+        return self.value_min is not None or self.value_max is not None
+
+    def threshold_expr(self, value_col: str) -> pl.Expr:
+        """Returns the boolean polars expression thresholding `value_col` into the predicate column.
+
+        Examples:
+            >>> cfg = ValuePredicateConfig(value_agg={"of": "x", "fn": "last"}, value_max=300)
+            >>> print(cfg.threshold_expr("__val__pf"))
+            [(col("__val__pf")) < (dyn int: 300)]
+            >>> cfg = ValuePredicateConfig(
+            ...     value_agg={"of": "x", "fn": "last"}, value_min=1.5, value_min_inclusive=True
+            ... )
+            >>> print(cfg.threshold_expr("__val__r"))
+            [(col("__val__r")) >= (dyn float: 1.5)]
+        """
+        criteria = []
+        if self.value_min is not None:
+            if self.value_min_inclusive:
+                criteria.append(pl.col(value_col) >= self.value_min)
+            else:
+                criteria.append(pl.col(value_col) > self.value_min)
+        if self.value_max is not None:
+            if self.value_max_inclusive:
+                criteria.append(pl.col(value_col) <= self.value_max)
+            else:
+                criteria.append(pl.col(value_col) < self.value_max)
+        if len(criteria) == 1:
+            return criteria[0]
+        return pl.all_horizontal(criteria)
+
+    @property
+    def is_plain(self) -> bool:
+        return False
+
+
 @dataclasses.dataclass
 class WindowConfig:
     """A configuration object for defining a window in the task extraction process.
@@ -855,6 +1014,47 @@ class EventConfig:
     predicate: str
 
 
+def _is_composite(predicate_spec: dict[str, Any]) -> bool:
+    """Whether a raw predicate spec is derived or value-based rather than plain."""
+    return isinstance(predicate_spec, dict) and bool(
+        {"expr", "value_agg", "value_expr"} & set(predicate_spec)
+    )
+
+
+def _parse_predicate(
+    name: str, spec: Any
+) -> PlainPredicateConfig | DerivedPredicateConfig | ValuePredicateConfig:
+    """Build the right predicate config object from a raw YAML spec.
+
+    Examples:
+        >>> _parse_predicate("p", {"code": "foo"})
+        PlainPredicateConfig(code='foo', value_min=None, value_max=None, value_min_inclusive=None,
+                             value_max_inclusive=None, static=False, other_cols={})
+        >>> _parse_predicate("p", {"expr": "or(a, b)"})
+        DerivedPredicateConfig(expr='or(a, b)', static=False)
+        >>> _parse_predicate("p", {"value_agg": {"of": "a", "fn": "last"}}).input_predicates
+        ['a']
+        >>> _parse_predicate("p", "???")
+        Traceback (most recent call last):
+            ...
+        ValueError: Predicate 'p' is not defined correctly in the configuration file. Currently
+        defined as the string: ???. Please refer to the documentation for the supported formats.
+    """
+    if isinstance(spec, str):
+        raise ValueError(
+            f"Predicate '{name}' is not defined correctly in the configuration file. "
+            f"Currently defined as the string: {spec}. "
+            "Please refer to the documentation for the supported formats."
+        )
+    if "expr" in spec:
+        return DerivedPredicateConfig(**spec)
+    if "value_agg" in spec or "value_expr" in spec:
+        return ValuePredicateConfig(**spec)
+    config_data = {k: v for k, v in spec.items() if k in PlainPredicateConfig.__dataclass_fields__}
+    other_cols = {k: v for k, v in spec.items() if k not in config_data}
+    return PlainPredicateConfig(**config_data, other_cols=other_cols)
+
+
 @dataclasses.dataclass
 class TaskExtractorConfig:
     """A configuration object for parsing the plain-data stored in a task extractor config.
@@ -1039,8 +1239,8 @@ class TaskExtractorConfig:
         >>> TaskExtractorConfig(predicates=predicates, trigger=trigger, windows={})
         Traceback (most recent call last):
             ...
-        ValueError: Invalid predicate configuration for 'foo': foo. Must be either a PlainPredicateConfig or
-        DerivedPredicateConfig object. Got: <class 'str'>
+        ValueError: Invalid predicate configuration for 'foo': foo. Must be a PlainPredicateConfig,
+        DerivedPredicateConfig or ValuePredicateConfig object. Got: <class 'str'>
         >>> predicates = {
         ...     "foo": PlainPredicateConfig("foo"),
         ...     "foobar": DerivedPredicateConfig("or(foo, bar)"),
@@ -1371,8 +1571,8 @@ class TaskExtractorConfig:
                     f"Something referenced predicate '{pred}' that wasn't defined in the configuration."
                 )
 
-            if "expr" in all_predicates[pred]:
-                stack = list(DerivedPredicateConfig(**all_predicates[pred]).input_predicates)
+            if _is_composite(all_predicates[pred]):
+                stack = list(_parse_predicate(pred, all_predicates[pred]).input_predicates)
 
                 while stack:
                     nested_pred = stack.pop()
@@ -1383,10 +1583,10 @@ class TaskExtractorConfig:
                             "configuration."
                         )
 
-                    # if nested_pred is a DerivedPredicateConfig, unpack input_predicates and add to stack
-                    if "expr" in all_predicates[nested_pred]:
-                        derived_config = DerivedPredicateConfig(**all_predicates[nested_pred])
-                        stack.extend(derived_config.input_predicates)
+                    # if nested_pred is itself composite, unpack input_predicates and add to stack
+                    if _is_composite(all_predicates[nested_pred]):
+                        nested_config = _parse_predicate(nested_pred, all_predicates[nested_pred])
+                        stack.extend(nested_config.input_predicates)
                         referenced_predicates.add(nested_pred)  # also add itself to referenced_predicates
                     else:
                         # if nested_pred is a PlainPredicateConfig, only add it to referenced_predicates
@@ -1396,18 +1596,7 @@ class TaskExtractorConfig:
         predicates_to_parse = {k: v for k, v in final_predicates.items() if k in referenced_predicates}
         predicate_objs = {}
         for n, p in predicates_to_parse.items():
-            if "expr" in p:
-                predicate_objs[n] = DerivedPredicateConfig(**p)
-            else:
-                if isinstance(p, str):
-                    raise ValueError(
-                        f"Predicate '{n}' is not defined correctly in the configuration file. "
-                        f"Currently defined as the string: {p}. "
-                        "Please refer to the documentation for the supported formats."
-                    )
-                config_data = {k: v for k, v in p.items() if k in PlainPredicateConfig.__dataclass_fields__}
-                other_cols = {k: v for k, v in p.items() if k not in config_data}
-                predicate_objs[n] = PlainPredicateConfig(**config_data, other_cols=other_cols)
+            predicate_objs[n] = _parse_predicate(n, p)
 
         if final_demographics:
             logger.info("Parsing patient demographics...")
@@ -1452,14 +1641,14 @@ class TaskExtractorConfig:
             match predicate:
                 case PlainPredicateConfig():
                     pass
-                case DerivedPredicateConfig():
+                case DerivedPredicateConfig() | ValuePredicateConfig():
                     for pred in predicate.input_predicates:
                         dag_relationships.append((pred, name))
                 case _:
                     raise ValueError(
                         f"Invalid predicate configuration for '{name}': {predicate}. "
-                        "Must be either a PlainPredicateConfig or DerivedPredicateConfig object. "
-                        f"Got: {type(predicate)}"
+                        "Must be a PlainPredicateConfig, DerivedPredicateConfig or "
+                        f"ValuePredicateConfig object. Got: {type(predicate)}"
                     )
 
         missing_predicates = []
@@ -1472,6 +1661,24 @@ class TaskExtractorConfig:
             raise KeyError(
                 f"Missing {len(missing_predicates)} relationships: " + "; ".join(missing_predicates)
             )
+
+        # A non-`count` aggregate needs a source carrying NUMERIC VALUES. Plain predicates carry
+        # their events' numeric_value and value predicates carry their own computed value; a derived
+        # `and(...)`/`or(...)` predicate is a boolean with no value, so aggregating it any other way
+        # than by counting is meaningless. Caught here rather than as a missing-column error deep in
+        # the polars engine.
+        for name, predicate in self.predicates.items():
+            if not isinstance(predicate, ValuePredicateConfig) or not predicate.value_agg:
+                continue
+            fn, src = predicate.value_agg["fn"], predicate.value_agg["of"]
+            if fn == "count" or src not in self.predicates:
+                continue
+            if isinstance(self.predicates[src], DerivedPredicateConfig):
+                raise ValueError(
+                    f"Value predicate '{name}' aggregates '{src}' with fn='{fn}', but '{src}' is a "
+                    f"derived and(...)/or(...) predicate, which carries no numeric value. Use "
+                    f"fn='count' to count its occurrences, or aggregate a plain predicate instead."
+                )
 
         self._predicate_dag_graph = nx.DiGraph(dag_relationships)
         if not nx.is_directed_acyclic_graph(self._predicate_dag_graph):
@@ -1681,6 +1888,27 @@ class TaskExtractorConfig:
     def plain_predicates(self) -> dict[str, PlainPredicateConfig]:
         """Returns a dictionary of plain predicates in {name: code} format."""
         return {p: cfg for p, cfg in self.predicates.items() if cfg.is_plain}
+
+    @property
+    def value_predicates(self) -> dict[str, ValuePredicateConfig]:
+        """Returns the value predicates, which carry a numeric quantity rather than an event count."""
+        return {p: cfg for p, cfg in self.predicates.items() if isinstance(cfg, ValuePredicateConfig)}
+
+    @property
+    def value_predicate_sources(self) -> frozenset[str]:
+        """Plain predicates whose numeric VALUES some value predicate needs.
+
+        `fn: count` only needs the source's event count, which the plain predicate column already
+        carries, so a source used solely that way is not listed here and no value column is
+        materialised for it.
+        """
+        needed = set()
+        for cfg in self.value_predicates.values():
+            if cfg.value_agg and cfg.value_agg["fn"] != "count":
+                needed.add(cfg.value_agg["of"])
+            elif cfg.value_expr:
+                needed.update(v for v in cfg.input_predicates)
+        return frozenset(n for n in needed if n in self.plain_predicates)
 
     @property
     def derived_predicates(self) -> OrderedDict[str, DerivedPredicateConfig]:
